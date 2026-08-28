@@ -85,11 +85,22 @@ function OnSetText(uri, text)
 
     local exports, hasTopReturn = exportEnv.scan(text)
     if #exports > 0 and not hasTopReturn then
-        diffs[#diffs + 1] = {
-            start  = 1,
-            finish = 0,
-            text   = 'local ' .. table.concat(exports, ', ') .. '\n',
-        }
+        -- Every name here becomes a real `local`, and Lua 5.1 caps a chunk at 200 active
+        -- locals - splitting into more `local` statements doesn't help, the cap is on the
+        -- total, not per-statement. A handful of FA files (EffectTemplates.lua: 869 top-level
+        -- table defs, verified) are themselves already past that, so above a safe threshold we
+        -- skip the local-ification and return plain globals instead - import() consumers still
+        -- resolve correctly, we just lose the in-file forward-reference benefit for that one
+        -- file, which barely matters for parallel data tables (as opposed to mutually-calling
+        -- functions, which is what the local-ification is really for).
+        local MAX_LOCALIZED_EXPORTS = 150
+        if #exports <= MAX_LOCALIZED_EXPORTS then
+            diffs[#diffs + 1] = {
+                start  = 1,
+                finish = 0,
+                text   = 'local ' .. table.concat(exports, ', ') .. '\n',
+            }
+        end
         local fields = {}
         for _, name in ipairs(exports) do
             fields[#fields + 1] = ('%s = %s'):format(name, name)
