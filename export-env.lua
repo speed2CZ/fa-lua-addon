@@ -6,6 +6,13 @@
 -- local-scoping is itself order-dependent and has to be decided by the real
 -- parser, which means it has to happen in the source text, before parsing.
 --
+-- Depth tracks both block keywords (function/if/do/repeat...end/until) AND `{`/`}`, since
+-- FA classes are one big table constructor (`Unit = ClassUnit(...) { Foo = function(self)
+-- ... end, ... }`) - without counting braces too, every `Key = function(...) end,` entry
+-- inside it looks exactly like a bare top-level export the moment its own function/end
+-- balances back to depth 0, and gets wrongly captured (verified against real FA files:
+-- lua/sim/Unit.lua alone went from 3 genuine top-level names to 329 false ones without this).
+--
 -- Known limitations (acceptable trade-off for a regex/state-machine scanner
 -- instead of a full parser): a bare multi-target assignment (`A, B = x, y`)
 -- only captures `A`; spaced-out member access (`t . Name = x`) isn't
@@ -136,6 +143,18 @@ function M.scan(text)
 
             lastWord = word
             prevChar = nil
+
+        elseif c == '{' then
+            depth = depth + 1
+            prevChar = nil
+            lastWord = nil
+            i = i + 1
+
+        elseif c == '}' then
+            depth = math.max(0, depth - 1)
+            prevChar = nil
+            lastWord = nil
+            i = i + 1
 
         else
             prevChar = (c == '.' or c == ':') and c or nil
