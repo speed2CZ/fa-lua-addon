@@ -1,6 +1,7 @@
 local files      = require 'files'
 local furi       = require 'file-uri'
 local exportEnv  = require 'export-env'
+local tableHints = require 'table-hints'
 
 -- FA's Lua preprocessor uses leading `#` for macro directives that aren't valid standard
 -- Lua syntax; blank them out (byte-for-byte, so all positions stay stable) before parsing.
@@ -10,9 +11,11 @@ local exportEnv  = require 'export-env'
 -- appending a real `return {...}` at the bottom - rather than patching the AST after parsing,
 -- because forward/mutual references between them only resolve correctly if the *parser* sees
 -- real `local`s; a post-parse transform is too late to change how names already resolved.
+-- Table constructors can also start with `{&15 &4}`-style preallocation hints, which aren't
+-- valid Lua 5.1 syntax at all - table-hints.lua blanks those out the same way.
 ---@param  uri  string
 ---@param  text string
----@return nil|diff[]
+---@return nil|fa.diff[]
 function OnSetText(uri, text)
     local diffs = {}
     for pos in text:gmatch '()#' do
@@ -21,6 +24,10 @@ function OnSetText(uri, text)
             finish = pos,
             text   = '--',
         }
+    end
+
+    for _, diff in ipairs(tableHints.stripHints(text)) do
+        diffs[#diffs + 1] = diff
     end
 
     local exports, hasTopReturn = exportEnv.scan(text)
