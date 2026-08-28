@@ -52,6 +52,16 @@ configs = {
         action = 'set',
         value  = false,
     },
+    {
+        -- `<<`/`>>` (bitwise shift) are version-gated in script/parser/compile.lua to
+        -- Lua 5.3+/LuaJIT, not controllable via nonstandardSymbol - but SupCom's engine
+        -- supports them despite everything else here needing Lua.runtime.version = 'Lua 5.1'.
+        -- Parsing itself isn't affected (the version check only pushes a diagnostic, parsing
+        -- continues either way), so just silence it.
+        key    = 'Lua.diagnostics.disable',
+        action = 'add',
+        value  = 'unsupport-symbol',
+    },
 }
 for _, name in ipairs {'moho'} do
     configs[#configs+1] = {
