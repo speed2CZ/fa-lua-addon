@@ -62,6 +62,20 @@ configs = {
         action = 'add',
         value  = 'unsupport-symbol',
     },
+    {
+        -- inject-field's "is this class exact" escape hatch (script/core/diagnostics/
+        -- inject-field.lua) depends on guide.getSelfNode, which only recognizes the implicit
+        -- `self` colon-sugar creates (function Foo:Method()) - not FA's own convention of
+        -- writing `self` out as an explicit parameter (Method = function(self) ... end). That
+        -- makes vm.getDefinedClass return nil for every FA method's `self`, which skips the
+        -- "class isn't exact, allow it" check entirely and falls into a stricter path that
+        -- flags any field first assigned via self.X = ... without a matching ---@field. Since
+        -- that's FA's normal way of initializing instance fields (e.g. BaseManager:Create()),
+        -- this fires constantly for correct code - disable rather than hand-document every field.
+        key    = 'Lua.diagnostics.disable',
+        action = 'add',
+        value  = 'inject-field',
+    },
 }
 for _, name in ipairs {'moho'} do
     configs[#configs+1] = {
