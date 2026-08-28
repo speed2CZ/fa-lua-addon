@@ -14,8 +14,7 @@
 -- lua/sim/Unit.lua alone went from 3 genuine top-level names to 329 false ones without this).
 --
 -- Known limitations (acceptable trade-off for a regex/state-machine scanner
--- instead of a full parser): a bare multi-target assignment (`A, B = x, y`)
--- only captures `A`; spaced-out member access (`t . Name = x`) isn't
+-- instead of a full parser): spaced-out member access (`t . Name = x`) isn't
 -- recognised as a member access and could false-positive.
 
 local M = {}
@@ -29,6 +28,39 @@ local LOOP_HEADER = { ['for'] = true, ['while'] = true }
 local function optsOut(text)
     return text:find('%-%-%-@declare%-global') ~= nil
         or text:find('%-%-%-@meta') ~= nil
+end
+
+--- Given the position right after an identifier, checks whether it's followed by
+--- `(, <name>)* =` (not `==`) - i.e. whether this identifier is one entry in a
+--- comma-separated name-list that ultimately ends in a bare assignment. Used so each name in
+--- `A, B, C = 1, 2, 3` can independently confirm its own membership, regardless of position.
+---@param text string
+---@param pos  integer
+---@param n    integer
+---@return boolean
+local function isNameListThenEquals(text, pos, n)
+    local k = pos
+    while true do
+        local _, we = text:find('^%s*', k)
+        k = we + 1
+        if text:sub(k, k) ~= ',' then
+            return false
+        end
+        k = k + 1
+        local _, we2 = text:find('^%s*', k)
+        k = we2 + 1
+        local ns, ne = text:find('^[%a_][%w_]*', k)
+        if not ns then
+            return false
+        end
+        k = ne + 1
+        local _, we3 = text:find('^%s*', k)
+        k = we3 + 1
+        if text:sub(k, k) == '=' and text:sub(k, k + 1) ~= '==' then
+            return true
+        end
+        -- else loop again, expecting another ", name"
+    end
 end
 
 ---@param text string
@@ -46,6 +78,11 @@ function M.scan(text)
     local lastWord = nil
     local prevChar = nil
     local hasTopReturn = false
+    -- Persists across the commas in a `local a, b, c = ...` name-list, unlike `lastWord`
+    -- (which resets on every comma) - needed so e.g. `local pairs, ipairs = pairs, ipairs`
+    -- doesn't wrongly treat `ipairs` as a bare export just because the comma before it wiped
+    -- `lastWord` back to nil.
+    local localList = false
 
     local exportsSet = {}
     local exports = {}
@@ -133,12 +170,20 @@ function M.scan(text)
                 if depth == 0 and loopHeaderDepth == 0 then
                     hasTopReturn = true
                 end
+            elseif word == 'local' then
+                localList = true
             elseif depth == 0 and loopHeaderDepth == 0
                and prevChar ~= '.' and prevChar ~= ':'
-               and lastWord ~= 'local' then
+               and not localList then
                 if nextChar == '=' and text:sub(k, k + 1) ~= '==' then
                     addExport(word)
+                elseif nextChar == ',' and isNameListThenEquals(text, i, n) then
+                    addExport(word)
                 end
+            end
+
+            if word ~= 'local' then
+                localList = localList and nextChar == ','
             end
 
             lastWord = word
