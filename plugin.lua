@@ -6,6 +6,7 @@ local tableHints   = require 'table-hints'
 local classSupport = require 'class-support'
 local forInPairs   = require 'for-in-pairs'
 local hookFiles    = require 'hook-files'
+local hashComments = require 'hash-comments'
 
 --- Finds every file in the workspace whose path ends with `/<relPath>` (extension-optional,
 --- case-insensitive) - shared by ResolveRequire and the hook-file target lookup below.
@@ -70,8 +71,9 @@ local function mergeSameStartDiffs(diffs)
     return merged
 end
 
--- FA's Lua preprocessor uses leading `#` for macro directives that aren't valid standard
--- Lua syntax; blank them out (byte-for-byte, so all positions stay stable) before parsing.
+-- FA's Lua preprocessor treats `#` as a comment-start, which isn't valid standard Lua syntax;
+-- hash-comments.lua blanks it out - carefully, since a blind replace corrupts string literals
+-- containing '#' and breaks --#region/--#endregion folding markers (both confirmed real).
 -- FA modules also don't `return {...}`: a file's bare top-level assignments/functions (no
 -- `local` keyword) ARE its exports, resolved at runtime by import(). We reproduce that here
 -- as real Lua - forward-declaring every such name as a `local` at the top of the file and
@@ -90,12 +92,8 @@ end
 ---@return nil|fa.diff[]
 function OnSetText(uri, text)
     local diffs = {}
-    for pos in text:gmatch '()#' do
-        diffs[#diffs + 1] = {
-            start  = pos,
-            finish = pos,
-            text   = '--',
-        }
+    for _, diff in ipairs(hashComments.stripHashComments(text)) do
+        diffs[#diffs + 1] = diff
     end
 
     for _, diff in ipairs(tableHints.stripHints(text)) do
@@ -138,6 +136,9 @@ function OnSetText(uri, text)
             -- anywhere but the very start of a file, so it has to go.
             targetText = targetText:gsub('^\239\187\191', '')
             local targetDiffs = {}
+            for _, d in ipairs(hashComments.stripHashComments(targetText)) do
+                targetDiffs[#targetDiffs + 1] = d
+            end
             for _, d in ipairs(tableHints.stripHints(targetText)) do
                 targetDiffs[#targetDiffs + 1] = d
             end
