@@ -1,7 +1,46 @@
-local files      = require 'files'
-local furi       = require 'file-uri'
-local exportEnv  = require 'export-env'
-local tableHints = require 'table-hints'
+local files        = require 'files'
+local furi         = require 'file-uri'
+local exportEnv    = require 'export-env'
+local tableHints   = require 'table-hints'
+local classSupport = require 'class-support'
+
+--- mergeDiff (script/string-merger.lua) sorts diffs by `start`, and table.sort isn't stable
+--- for ties, so two diffs that both target the same position race: which one "wins" is
+--- undefined and can corrupt output (verified by hand against mergeDiff's cur/buf bookkeeping).
+--- Since we run four independent scanners into one diff list, collapse any diffs that land on
+--- the same `start` into one before returning, instead of trying to keep each scanner from
+--- ever colliding with the others.
+---@param diffs fa.diff[]
+---@return fa.diff[]
+local function mergeSameStartDiffs(diffs)
+    local groups, order = {}, {}
+    for _, d in ipairs(diffs) do
+        if not groups[d.start] then
+            groups[d.start] = {}
+            order[#order + 1] = d.start
+        end
+        table.insert(groups[d.start], d)
+    end
+
+    local merged = {}
+    for _, start in ipairs(order) do
+        local group = groups[start]
+        if #group == 1 then
+            merged[#merged + 1] = group[1]
+        else
+            local finish = start - 1
+            local text = {}
+            for _, d in ipairs(group) do
+                if d.finish >= start then
+                    finish = math.max(finish, d.finish)
+                end
+                text[#text + 1] = d.text
+            end
+            merged[#merged + 1] = { start = start, finish = finish, text = table.concat(text) }
+        end
+    end
+    return merged
+end
 
 -- FA's Lua preprocessor uses leading `#` for macro directives that aren't valid standard
 -- Lua syntax; blank them out (byte-for-byte, so all positions stay stable) before parsing.
@@ -12,7 +51,10 @@ local tableHints = require 'table-hints'
 -- because forward/mutual references between them only resolve correctly if the *parser* sees
 -- real `local`s; a post-parse transform is too late to change how names already resolved.
 -- Table constructors can also start with `{&15 &4}`-style preallocation hints, which aren't
--- valid Lua 5.1 syntax at all - table-hints.lua blanks those out the same way.
+-- valid Lua 5.1 syntax at all - table-hints.lua blanks those out the same way. And FA classes
+-- (`Name = ClassFn(Bases...) { specs }`) don't register their methods as class members unless
+-- the `ClassFn(...)` wrapper is stripped down to a plain `Name = { specs }` first - see
+-- class-support.lua.
 ---@param  uri  string
 ---@param  text string
 ---@return nil|fa.diff[]
@@ -30,22 +72,17 @@ function OnSetText(uri, text)
         diffs[#diffs + 1] = diff
     end
 
+    for _, diff in ipairs(classSupport.stripWrappers(text)) do
+        diffs[#diffs + 1] = diff
+    end
+
     local exports, hasTopReturn = exportEnv.scan(text)
     if #exports > 0 and not hasTopReturn then
-        -- mergeDiff sorts all diffs by `start`, and table.sort isn't stable for ties, so a
-        -- plain `{start=1, finish=0}` insertion here would race the '#' diff above whenever
-        -- the file's first byte is itself '#' (undefined which one wins -> corrupted output).
-        -- Merge into that diff instead of adding a second one at the same position.
-        local prependText = 'local ' .. table.concat(exports, ', ') .. '\n'
-        if diffs[1] and diffs[1].start == 1 then
-            diffs[1].text = prependText .. diffs[1].text
-        else
-            table.insert(diffs, 1, {
-                start  = 1,
-                finish = 0,
-                text   = prependText,
-            })
-        end
+        diffs[#diffs + 1] = {
+            start  = 1,
+            finish = 0,
+            text   = 'local ' .. table.concat(exports, ', ') .. '\n',
+        }
         local fields = {}
         for _, name in ipairs(exports) do
             fields[#fields + 1] = ('%s = %s'):format(name, name)
@@ -57,7 +94,7 @@ function OnSetText(uri, text)
         }
     end
 
-    return diffs
+    return mergeSameStartDiffs(diffs)
 end
 
 -- import()/doscript() take root-relative paths like '/lua/sim/Weapon.lua', optionally without
