@@ -1,9 +1,36 @@
 local files        = require 'files'
 local furi         = require 'file-uri'
+local smerger      = require 'string-merger'
 local exportEnv    = require 'export-env'
 local tableHints   = require 'table-hints'
 local classSupport = require 'class-support'
 local forInPairs   = require 'for-in-pairs'
+local hookFiles    = require 'hook-files'
+
+--- Finds every file in the workspace whose path ends with `/<relPath>` (extension-optional,
+--- case-insensitive) - shared by ResolveRequire and the hook-file target lookup below.
+---@param uri     string
+---@param relPath string
+---@return string[]
+local function findUrisBySuffix(uri, relPath)
+    local target = relPath:gsub('\\', '/'):gsub('^/', ''):lower()
+    if not target:match('%.lua$') then
+        target = target .. '.lua'
+    end
+    local suffix = '/' .. target
+
+    local results = {}
+    for fileUri in files.eachFile(uri) do
+        local filePath = furi.decode(fileUri)
+        if filePath then
+            local normalized = filePath:gsub('\\', '/'):lower()
+            if normalized:sub(-#suffix) == suffix then
+                results[#results + 1] = fileUri
+            end
+        end
+    end
+    return results
+end
 
 --- mergeDiff (script/string-merger.lua) sorts diffs by `start`, and table.sort isn't stable
 --- for ties, so two diffs that both target the same position race: which one "wins" is
@@ -83,6 +110,45 @@ function OnSetText(uri, text)
         diffs[#diffs + 1] = diff
     end
 
+    -- Hook files (MODS.LUA:150-198): the mod's file is concatenated to the END of the target
+    -- at runtime, sharing its top-level scope. We reproduce that by prepending the target's
+    -- content here. Deliberately use the target's RAW text (files.getOriginText), not its own
+    -- transformed text: the target's own export-env pass would have turned its top-level names
+    -- into locals scoped to nothing but itself, plus appended a `return {...}` - concatenated
+    -- in front of the hook's own code, a mid-chunk `return` is an actual syntax error. Raw text
+    -- keeps the target's names as the real globals the hook is supposed to see, and we still
+    -- run the (non-scope-changing) table-hints/class-support/for-in-pairs passes over it so
+    -- `Cls = Class(oldCls) {...}`-style overrides still get proper class typing.
+    local hookTarget = hookFiles.findTarget(uri, text)
+    if hookTarget then
+        local targetUri
+        for _, candidate in ipairs(findUrisBySuffix(uri, hookTarget)) do
+            if candidate ~= uri then
+                targetUri = candidate
+                break
+            end
+        end
+        local targetText = targetUri and files.getOriginText(targetUri)
+        if targetText then
+            local targetDiffs = {}
+            for _, d in ipairs(tableHints.stripHints(targetText)) do
+                targetDiffs[#targetDiffs + 1] = d
+            end
+            for _, d in ipairs(classSupport.stripWrappers(targetText)) do
+                targetDiffs[#targetDiffs + 1] = d
+            end
+            for _, d in ipairs(forInPairs.wrapBareIterators(targetText)) do
+                targetDiffs[#targetDiffs + 1] = d
+            end
+            local transformedTarget = smerger.mergeDiff(targetText, mergeSameStartDiffs(targetDiffs))
+            diffs[#diffs + 1] = {
+                start  = 1,
+                finish = 0,
+                text   = '---@diagnostic disable\n' .. transformedTarget .. '\n---@diagnostic enable\n',
+            }
+        end
+    end
+
     local exports, hasTopReturn = exportEnv.scan(text)
     if #exports > 0 and not hasTopReturn then
         -- Every name here becomes a real `local`, and Lua 5.1 caps a chunk at 200 active
@@ -128,23 +194,7 @@ function ResolveRequire(uri, name, suri)
         return nil
     end
 
-    local target = name:gsub('\\', '/'):gsub('^/', ''):lower()
-    if not target:match('%.lua$') then
-        target = target .. '.lua'
-    end
-    local suffix = '/' .. target
-
-    local results = {}
-    for fileUri in files.eachFile(uri) do
-        local filePath = furi.decode(fileUri)
-        if filePath then
-            local normalized = filePath:gsub('\\', '/'):lower()
-            if normalized:sub(-#suffix) == suffix then
-                results[#results + 1] = fileUri
-            end
-        end
-    end
-
+    local results = findUrisBySuffix(uri, name)
     if #results > 0 then
         return results
     end
