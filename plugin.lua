@@ -3,6 +3,7 @@ local furi         = require 'file-uri'
 local exportEnv    = require 'export-env'
 local tableHints   = require 'table-hints'
 local classSupport = require 'class-support'
+local forInPairs   = require 'for-in-pairs'
 
 --- mergeDiff (script/string-merger.lua) sorts diffs by `start`, and table.sort isn't stable
 --- for ties, so two diffs that both target the same position race: which one "wins" is
@@ -51,10 +52,12 @@ end
 -- because forward/mutual references between them only resolve correctly if the *parser* sees
 -- real `local`s; a post-parse transform is too late to change how names already resolved.
 -- Table constructors can also start with `{&15 &4}`-style preallocation hints, which aren't
--- valid Lua 5.1 syntax at all - table-hints.lua blanks those out the same way. And FA classes
+-- valid Lua 5.1 syntax at all - table-hints.lua blanks those out the same way. FA classes
 -- (`Name = ClassFn(Bases...) { specs }`) don't register their methods as class members unless
 -- the `ClassFn(...)` wrapper is stripped down to a plain `Name = { specs }` first - see
--- class-support.lua.
+-- class-support.lua. And `for a, b in someTable do` (no pairs()/ipairs()) is valid syntax
+-- SupCom's engine gives pairs()-like semantics to, but LuaLS can't type it without an actual
+-- call to read a signature off of - for-in-pairs.lua rewrites it to `in pairs(someTable) do`.
 ---@param  uri  string
 ---@param  text string
 ---@return nil|fa.diff[]
@@ -73,6 +76,10 @@ function OnSetText(uri, text)
     end
 
     for _, diff in ipairs(classSupport.stripWrappers(text)) do
+        diffs[#diffs + 1] = diff
+    end
+
+    for _, diff in ipairs(forInPairs.wrapBareIterators(text)) do
         diffs[#diffs + 1] = diff
     end
 
