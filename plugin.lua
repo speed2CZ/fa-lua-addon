@@ -130,6 +130,13 @@ function OnSetText(uri, text)
         end
         local targetText = targetUri and files.getOriginText(targetUri)
         if targetText then
+            -- script/encoder/init.lua's decode() is a no-op for utf8, so a target file with a
+            -- literal UTF-8 BOM (confirmed on loc/*/strings_db.lua, e.g.) keeps those 3 raw
+            -- bytes in files.getOriginText's result. Harmless at a real position-1 file start
+            -- (editors strip it before it ever reaches didOpen), but here it'd land mid-stream,
+            -- right where the target's first real line is expected - not valid Lua syntax
+            -- anywhere but the very start of a file, so it has to go.
+            targetText = targetText:gsub('^\239\187\191', '')
             local targetDiffs = {}
             for _, d in ipairs(tableHints.stripHints(targetText)) do
                 targetDiffs[#targetDiffs + 1] = d
