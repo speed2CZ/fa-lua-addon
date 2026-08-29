@@ -152,6 +152,39 @@ local function splitTopLevelArgs(argsText)
     return parts
 end
 
+---@param s string
+---@return boolean
+local function isSimpleTypeName(s)
+    if s == '' then
+        return false
+    end
+    for segment in (s .. '.'):gmatch('([^.]*)%.') do
+        if not segment:match('^[%a_][%w_]*$') then
+            return false
+        end
+    end
+    return true
+end
+
+--- Classifies a raw `Class(...)` base-argument's source text into something usable in a
+--- `---@class X: Base` doc. Only a bare type-name (dotted-identifier chain, e.g.
+--- `moho.unit_methods`) is a valid LuaLS type reference; anything else - a call, indexing on a
+--- call result, etc. - isn't, and dropping the raw text in verbatim (e.g.
+--- `import("/lua/sim/prop.lua").Prop`) produces a malformed reference LuaLS reports as an
+--- undefined class (confirmed: env/*/Props/*/*_script.lua's recurring `Class(import(path).Name)`
+--- pattern). That specific shape is common enough to special-case: extract just `Name` and use
+--- that - correct whenever the target file kept its default, unrenamed class name, which fails
+--- safe even when wrong (a missing inherited-member completion, not a new diagnostic). Anything
+--- else unrecognised is dropped rather than guessed at.
+---@param baseText string
+---@return string?
+local function sanitizeBase(baseText)
+    if isSimpleTypeName(baseText) then
+        return baseText
+    end
+    return baseText:match('^import%s*%b()%.([%a_][%w_]*)$')
+end
+
 ---@param text string
 ---@return fa.diff[]
 function M.stripWrappers(text)
@@ -224,7 +257,14 @@ function M.stripWrappers(text)
                         j = j + 1
                     end
                     if j <= n then
-                        bases = splitTopLevelArgs(text:sub(k + 1, j - 1))
+                        local rawBases = splitTopLevelArgs(text:sub(k + 1, j - 1))
+                        bases = {}
+                        for _, raw in ipairs(rawBases) do
+                            local sanitized = sanitizeBase(raw)
+                            if sanitized then
+                                bases[#bases + 1] = sanitized
+                            end
+                        end
                         k = j + 1
                         local _, we2 = text:find('^%s*', k)
                         k = we2 + 1
