@@ -66,9 +66,10 @@ end
 ---@param text string
 ---@return string[] exports  ordered, de-duplicated bare top-level names
 ---@return boolean  hasTopReturn  whether the file already has a top-level `return`
+---@return integer  topLevelLocalCount  count of the file's own pre-existing top-level locals
 function M.scan(text)
     if optsOut(text) then
-        return {}, false
+        return {}, false, 0
     end
 
     local n = #text
@@ -83,6 +84,13 @@ function M.scan(text)
     -- doesn't wrongly treat `ipairs` as a bare export just because the comma before it wiped
     -- `lastWord` back to nil.
     local localList = false
+    -- Counts every top-level `local` name (including `local function Name()`) that already
+    -- exists in the file, so the caller can tell whether adding `#exports` more locals on top
+    -- would cross Lua's 200-local-per-chunk cap - the cap is on the combined total, not on
+    -- `#exports` alone (verified against real files: lua/ui/lobby/lobby.lua has 108 bare exports,
+    -- comfortably under a 150-only threshold, but 120 pre-existing top-level locals of its own
+    -- push the true total to 228).
+    local topLevelLocalCount = 0
 
     local exportsSet = {}
     local exports = {}
@@ -151,10 +159,14 @@ function M.scan(text)
 
             if word == 'function' then
                 depth = depth + 1
-                if depth == 1 and loopHeaderDepth == 0 and lastWord ~= 'local' then
-                    local ns, _, fname = text:find('^%s*([%a_][%w_]*)%s*%(', i)
-                    if ns then
-                        addExport(fname)
+                if depth == 1 and loopHeaderDepth == 0 then
+                    if lastWord == 'local' then
+                        topLevelLocalCount = topLevelLocalCount + 1
+                    else
+                        local ns, _, fname = text:find('^%s*([%a_][%w_]*)%s*%(', i)
+                        if ns then
+                            addExport(fname)
+                        end
                     end
                 end
             elseif BLOCK_OPEN[word] then
@@ -173,9 +185,10 @@ function M.scan(text)
             elseif word == 'local' then
                 localList = true
             elseif depth == 0 and loopHeaderDepth == 0
-               and prevChar ~= '.' and prevChar ~= ':'
-               and not localList then
-                if nextChar == '=' and text:sub(k, k + 1) ~= '==' then
+               and prevChar ~= '.' and prevChar ~= ':' then
+                if localList then
+                    topLevelLocalCount = topLevelLocalCount + 1
+                elseif nextChar == '=' and text:sub(k, k + 1) ~= '==' then
                     addExport(word)
                 elseif nextChar == ',' and isNameListThenEquals(text, i, n) then
                     addExport(word)
@@ -208,7 +221,7 @@ function M.scan(text)
         end
     end
 
-    return exports, hasTopReturn
+    return exports, hasTopReturn, topLevelLocalCount
 end
 
 return M

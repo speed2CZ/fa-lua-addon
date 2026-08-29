@@ -157,18 +157,23 @@ function OnSetText(uri, text)
         end
     end
 
-    local exports, hasTopReturn = exportEnv.scan(text)
+    local exports, hasTopReturn, topLevelLocalCount = exportEnv.scan(text)
     if #exports > 0 and not hasTopReturn then
         -- Every name here becomes a real `local`, and Lua 5.1 caps a chunk at 200 active
         -- locals - splitting into more `local` statements doesn't help, the cap is on the
-        -- total, not per-statement. A handful of FA files (EffectTemplates.lua: 869 top-level
-        -- table defs, verified) are themselves already past that, so above a safe threshold we
-        -- skip the local-ification and return plain globals instead - import() consumers still
-        -- resolve correctly, we just lose the in-file forward-reference benefit for that one
-        -- file, which barely matters for parallel data tables (as opposed to mutually-calling
-        -- functions, which is what the local-ification is really for).
-        local MAX_LOCALIZED_EXPORTS = 150
-        if #exports <= MAX_LOCALIZED_EXPORTS then
+        -- total, not per-statement, and it's the file's *combined* total (our added exports
+        -- PLUS whatever top-level locals it already had) that matters, not #exports alone:
+        -- lua/ui/lobby/lobby.lua has only 108 bare exports (well under a 150-only threshold)
+        -- but 120 pre-existing top-level locals of its own, for a real total of 228 - verified
+        -- against the actual file before picking this threshold. A few FA files (EffectTemplates.lua:
+        -- 869 top-level table defs) are themselves already past 200 on their own, so above a safe
+        -- combined threshold we skip the local-ification and return plain globals instead -
+        -- import() consumers still resolve correctly, and in-file forward references should too
+        -- (globals aren't lexically scoped by position the way locals are - see the
+        -- vm.hasGlobalSets/compileAst research from when export-env.lua was first built) - we
+        -- just lose the belt-and-suspenders local-ification for that one file.
+        local MAX_TOTAL_TOP_LEVEL_LOCALS = 190
+        if (#exports + topLevelLocalCount) <= MAX_TOTAL_TOP_LEVEL_LOCALS then
             diffs[#diffs + 1] = {
                 start  = 1,
                 finish = 0,
