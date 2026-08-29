@@ -1,10 +1,14 @@
 -- Heuristic pre-parse scanner (not a real parser): finds FA's bare top-level
--- declarations (`Name = ...` / `function Name(...)`, no `local` keyword) so
--- OnSetText can forward-declare them as real locals before the actual parser
--- ever sees the file. That's what makes forward/mutual references between
--- them resolve correctly - a post-parse AST patch can't do that, since Lua's
--- local-scoping is itself order-dependent and has to be decided by the real
--- parser, which means it has to happen in the source text, before parsing.
+-- declarations (`Name = ...` / `function Name(...)`, no `local` keyword) and rewrites the
+-- whole file into a classic Lua module: `local M = {}`, every export becomes `M.Name = ...`,
+-- and the file ends with `return M`. That's what makes forward/mutual references between
+-- exports resolve correctly, including from *inside* an earlier-defined function's body: `M`
+-- itself is assigned exactly once (`local M = {}`), so its own local-scoping is trivially
+-- unambiguous regardless of where in the file it's referenced from, and `M.Name` field
+-- resolution (unlike a bare local) isn't restricted to "last assignment before this textual
+-- position" - LuaLS resolves it by merging every known `M.Name = ...` in the file, wherever it
+-- sits. This also sidesteps Lua 5.1's 200-local-per-chunk cap entirely for exported names,
+-- since table fields don't consume it - only forward-declared *unsafe* names (see below) do.
 --
 -- Depth tracks both block keywords (function/if/do/repeat...end/until) AND `{`/`}`, since
 -- FA classes are one big table constructor (`Unit = ClassUnit(...) { Foo = function(self)
@@ -12,6 +16,20 @@
 -- inside it looks exactly like a bare top-level export the moment its own function/end
 -- balances back to depth 0, and gets wrongly captured (verified against real FA files:
 -- lua/sim/Unit.lua alone went from 3 genuine top-level names to 329 false ones without this).
+--
+-- Rewriting every REFERENCE (not just each definition) to `M.Name` is only safe for a name
+-- that isn't shadowed anywhere in the file - a `local`, function parameter, or `for` loop
+-- variable sharing the same name would have every bare use *inside its own scope* wrongly
+-- redirected to the module field otherwise (confirmed with a real example:
+-- lua/system/profile.lua does `checkpoint = debug.profiledata` at the top level, then
+-- `function checkpoint_to_table(checkpoint)` - the parameter shadows the export for that
+-- function's whole body). A file-wide "does this name appear as a local/param/loop-var
+-- anywhere" scan is a conservative, whole-file-granularity substitute for real scope
+-- resolution: names it flags ("unsafe") keep today's exact behaviour (forward-declared as a
+-- real `local`, bridged into `M` with one `M.Name = Name` assignment before `return M`) rather
+-- than risk a wrong rewrite. Verified empirically negligible: across all 2,801 *.lua files in
+-- the fa repo (102,668 top-level exports total), only 24 files / 57 names are ever shadowed
+-- anywhere in their own file.
 --
 -- Known limitations (acceptable trade-off for a regex/state-machine scanner
 -- instead of a full parser): spaced-out member access (`t . Name = x`) isn't
@@ -63,13 +81,56 @@ local function isNameListThenEquals(text, pos, n)
     end
 end
 
+--- Given the position right after `function`, finds and returns the parameter-list body text
+--- (between the parens), covering `function Name(...)`, `function Obj.Name(...)`,
+--- `function Obj:Method(...)` and anonymous `function(...)` alike - the name/dotted/colon
+--- chain in front of the parens (if any) doesn't matter, only the parens themselves do.
+---@param text string
+---@param pos  integer  position right after the `function` keyword
+---@return string?
+local function findParamsText(text, pos)
+    local j = pos
+    local n = #text
+    while j <= n and text:sub(j, j):match('[%s%w_%.%:]') do
+        j = j + 1
+    end
+    if text:sub(j, j) ~= '(' then
+        return nil
+    end
+    local closeParen = text:find(')', j, true)
+    if not closeParen then
+        return nil
+    end
+    return text:sub(j + 1, closeParen - 1)
+end
+
+--- Splits a `for` loop header's variable-name list (numeric or generic form) starting right
+--- after the `for` keyword, returning every comma-separated name up to (not including) the
+--- `=` or `in` that ends the list. These are implicitly local for the loop body.
+---@param text string
+---@param pos  integer  position right after the `for` keyword
+---@return string[]
+local function findForLoopVars(text, pos)
+    local names = {}
+    local namesText = text:match('^%s*([%a_][%w_%s,]-)%s*=', pos)
+        or text:match('^%s*([%a_][%w_%s,]-)%s+in%f[%A]', pos)
+    if namesText then
+        for nm in namesText:gmatch('[%a_][%w_]*') do
+            names[#names + 1] = nm
+        end
+    end
+    return names
+end
+
 ---@param text string
 ---@return string[] exports  ordered, de-duplicated bare top-level names
 ---@return boolean  hasTopReturn  whether the file already has a top-level `return`
 ---@return integer  topLevelLocalCount  count of the file's own pre-existing top-level locals
+---@return table<string, boolean> unsafeNames  export names shadowed by a local/param/loop-var
+---                                somewhere in the file - unsafe to rewrite every reference of
 function M.scan(text)
     if optsOut(text) then
-        return {}, false, 0
+        return {}, false, 0, {}
     end
 
     local n = #text
@@ -85,12 +146,14 @@ function M.scan(text)
     -- `lastWord` back to nil.
     local localList = false
     -- Counts every top-level `local` name (including `local function Name()`) that already
-    -- exists in the file, so the caller can tell whether adding `#exports` more locals on top
-    -- would cross Lua's 200-local-per-chunk cap - the cap is on the combined total, not on
-    -- `#exports` alone (verified against real files: lua/ui/lobby/lobby.lua has 108 bare exports,
-    -- comfortably under a 150-only threshold, but 120 pre-existing top-level locals of its own
-    -- push the true total to 228).
+    -- exists in the file, so the caller can tell whether adding more locals (for unsafe names)
+    -- would cross Lua's 200-local-per-chunk cap.
     local topLevelLocalCount = 0
+
+    -- Every name introduced as a `local` (any depth), a function parameter (any depth, any
+    -- function), or a `for` loop variable (any depth) anywhere in the file - a superset used
+    -- below to flag which exports are unsafe to rewrite at every reference site.
+    local localOrParamNames = {}
 
     local exportsSet = {}
     local exports = {}
@@ -169,6 +232,22 @@ function M.scan(text)
                         end
                     end
                 end
+                -- this function's own parameters are locally-scoped to its body, at any depth
+                local paramsText = findParamsText(text, i)
+                if paramsText then
+                    -- Lua 5.4 (the runtime LuaLS executes plugins under) makes generic-for
+                    -- control variables implicitly const - reassigning `p` directly here is a
+                    -- compile error ("attempt to assign to const variable 'p'") that fails this
+                    -- whole module's `require`, taking every other scanner down with it (the
+                    -- exact cause of a prior "everything is broken" regression - confirmed via
+                    -- the LuaLS output log's stack traceback pointing at this line).
+                    for rawParam in paramsText:gmatch('[^,]+') do
+                        local p = rawParam:match('^%s*(.-)%s*$')
+                        if p:match('^[%a_][%w_]*$') then
+                            localOrParamNames[p] = true
+                        end
+                    end
+                end
             elseif BLOCK_OPEN[word] then
                 depth = depth + 1
                 if word == 'do' and loopHeaderDepth > 0 then
@@ -178,6 +257,11 @@ function M.scan(text)
                 depth = math.max(0, depth - 1)
             elseif LOOP_HEADER[word] then
                 loopHeaderDepth = loopHeaderDepth + 1
+                if word == 'for' then
+                    for _, nm in ipairs(findForLoopVars(text, i)) do
+                        localOrParamNames[nm] = true
+                    end
+                end
             elseif word == 'return' then
                 if depth == 0 and loopHeaderDepth == 0 then
                     hasTopReturn = true
@@ -193,6 +277,10 @@ function M.scan(text)
                 elseif nextChar == ',' and isNameListThenEquals(text, i, n) then
                     addExport(word)
                 end
+            end
+
+            if localList then
+                localOrParamNames[word] = true
             end
 
             if word ~= 'local' then
@@ -221,7 +309,130 @@ function M.scan(text)
         end
     end
 
-    return exports, hasTopReturn, topLevelLocalCount
+    local unsafeNames = {}
+    for _, name in ipairs(exports) do
+        if localOrParamNames[name] then
+            unsafeNames[name] = true
+        end
+    end
+
+    return exports, hasTopReturn, topLevelLocalCount, unsafeNames
+end
+
+--- Second pass: for every bare occurrence of a name in `safeNames`, not preceded by `.`/`:`
+--- (member access on something else), produces a diff inserting `M.` immediately before it.
+--- Handles both definition sites (`Name = ...` -> `M.Name = ...`, `function Name(...)` ->
+--- `function M.Name(...)`) and every later reference uniformly - the same insert-before-token
+--- diff does both jobs, no separate "is this the definition" tracking needed.
+---
+--- A bare `Name` immediately followed by `=` (not `==`) is only rewritten at `depth == 0`: at
+--- `depth > 0` that shape is a table-constructor key (`{ Name = value }`), not an assignment -
+--- exactly the same hazard, and the same depth-based fix, as the original brace-depth bug in
+--- `M.scan` above. A `Name` NOT followed by `=` is always a genuine read, safe to rewrite at
+--- any depth.
+---@param text       string
+---@param safeNames  table<string, boolean>
+---@return fa.diff[]
+function M.rewriteReferences(text, safeNames)
+    local n = #text
+    local i = 1
+    local depth = 0
+    local loopHeaderDepth = 0
+    local prevChar = nil
+    local diffs = {}
+
+    while i <= n do
+        local c = text:sub(i, i)
+
+        if c == '-' and text:sub(i, i + 1) == '--' then
+            local afterDashes = i + 2
+            local eqs = text:match('^%[(=*)%[', afterDashes)
+            if eqs then
+                local _, closeEnd = text:find(']' .. eqs .. ']', afterDashes + 2 + #eqs, true)
+                i = closeEnd and (closeEnd + 1) or (n + 1)
+            else
+                local nl = text:find('\n', i, true)
+                i = nl and (nl + 1) or (n + 1)
+            end
+
+        elseif c == '"' or c == "'" then
+            local quote = c
+            local j = i + 1
+            while j <= n do
+                local cj = text:sub(j, j)
+                if cj == '\\' then
+                    j = j + 2
+                elseif cj == quote then
+                    j = j + 1
+                    break
+                else
+                    j = j + 1
+                end
+            end
+            i = j
+            prevChar = quote
+
+        elseif c == '[' then
+            local eqs = text:match('^%[(=*)%[', i)
+            if eqs then
+                local _, closeEnd = text:find(']' .. eqs .. ']', i + 2 + #eqs, true)
+                i = closeEnd and (closeEnd + 1) or (n + 1)
+            else
+                i = i + 1
+            end
+            prevChar = ']'
+
+        elseif c:match('%s') then
+            i = i + 1
+
+        elseif c:match('[%a_]') then
+            local wordStart = i
+            local _, e, word = text:find('^([%a_][%w_]*)', i)
+            i = e + 1
+
+            local k = i
+            while k <= n and text:sub(k, k):match('%s') do
+                k = k + 1
+            end
+            local nextChar = text:sub(k, k)
+
+            if word == 'function' then
+                depth = depth + 1
+            elseif BLOCK_OPEN[word] then
+                depth = depth + 1
+                if word == 'do' and loopHeaderDepth > 0 then
+                    loopHeaderDepth = loopHeaderDepth - 1
+                end
+            elseif BLOCK_CLOSE[word] then
+                depth = math.max(0, depth - 1)
+            elseif LOOP_HEADER[word] then
+                loopHeaderDepth = loopHeaderDepth + 1
+            elseif safeNames[word] and prevChar ~= '.' and prevChar ~= ':' then
+                local isEqTarget = nextChar == '=' and text:sub(k, k + 1) ~= '=='
+                if not isEqTarget or depth == 0 then
+                    diffs[#diffs + 1] = { start = wordStart, finish = wordStart - 1, text = 'M.' }
+                end
+            end
+
+            prevChar = nil
+
+        elseif c == '{' then
+            depth = depth + 1
+            prevChar = nil
+            i = i + 1
+
+        elseif c == '}' then
+            depth = math.max(0, depth - 1)
+            prevChar = nil
+            i = i + 1
+
+        else
+            prevChar = (c == '.' or c == ':') and c or nil
+            i = i + 1
+        end
+    end
+
+    return diffs
 end
 
 return M

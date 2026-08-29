@@ -71,15 +71,51 @@ local function mergeSameStartDiffs(diffs)
     return merged
 end
 
+--- mergeDiff tracks a single `cur` position through diffs *sorted by `start`*, advancing
+--- `cur = diff.finish + 1` after each - it assumes diffs never overlap in range.
+--- mergeSameStartDiffs only ever collapsed diffs sharing the exact same `start`; it never
+--- handled two diffs with *different* starts whose ranges overlap (e.g. class-support.lua's
+--- diff blanking out an entire `ClassFn(Bases...)` call, and a nested diff landing on a
+--- base-class argument that happens to reference another export of the same file - a real
+--- FA pattern: a file defining a base class, then deriving another class from it). When that
+--- happens, the nested diff's `finish` is *less* than what `cur` already advanced to from the
+--- wider diff, so `cur` moves backward - the next `text:sub(cur, nextDiff.start - 1)` then
+--- re-emits already-consumed source text, corrupting everything processed afterward in that
+--- file (confirmed by hand against mergeDiff's cur/buf bookkeeping, and reproduced/fixed in
+--- the scratchpad Python port before writing this).
+--- Resolves this by dropping any diff whose `start` falls at or before the highest `finish`
+--- an already-accepted diff claimed - safe unconditionally, since that range's original
+--- content is being replaced by the wider diff regardless, so a nested insertion inside it is
+--- always moot, never wanted. Call this *after* mergeSameStartDiffs, so same-start collisions
+--- (e.g. a `---@class` doc and an `M.` prefix landing on the same position) still combine into
+--- one diff first, in append order, before this resolves genuinely overlapping ranges.
+---@param diffs fa.diff[]
+---@return fa.diff[]
+local function resolveOverlappingDiffs(diffs)
+    table.sort(diffs, function(a, b) return a.start < b.start end)
+    local result = {}
+    local claimedUntil = 0
+    for _, d in ipairs(diffs) do
+        if d.start > claimedUntil then
+            result[#result + 1] = d
+            claimedUntil = math.max(claimedUntil, d.finish)
+        end
+    end
+    return result
+end
+
 -- FA's Lua preprocessor treats `#` as a comment-start, which isn't valid standard Lua syntax;
 -- hash-comments.lua blanks it out - carefully, since a blind replace corrupts string literals
 -- containing '#' and breaks --#region/--#endregion folding markers (both confirmed real).
 -- FA modules also don't `return {...}`: a file's bare top-level assignments/functions (no
 -- `local` keyword) ARE its exports, resolved at runtime by import(). We reproduce that here
--- as real Lua - forward-declaring every such name as a `local` at the top of the file and
--- appending a real `return {...}` at the bottom - rather than patching the AST after parsing,
--- because forward/mutual references between them only resolve correctly if the *parser* sees
--- real `local`s; a post-parse transform is too late to change how names already resolved.
+-- as a real Lua module - `local M = {}`, every export rewritten to `M.Name = ...` (definition
+-- *and* every reference), `return M` at the bottom - rather than patching the AST after
+-- parsing, because forward/mutual references between exports only resolve correctly if the
+-- *parser* sees the real `M.Name` field assignments; a post-parse transform is too late to
+-- change how names already resolved. See export-env.lua for why this fixes forward-references
+-- from inside an earlier-defined function's body (which forward-declared locals alone can't)
+-- and why a small, empirically-measured subset of shadowed names is deliberately left alone.
 -- Table constructors can also start with `{&15 &4}`-style preallocation hints, which aren't
 -- valid Lua 5.1 syntax at all - table-hints.lua blanks those out the same way. FA classes
 -- (`Name = ClassFn(Bases...) { specs }`) don't register their methods as class members unless
@@ -148,7 +184,7 @@ function OnSetText(uri, text)
             for _, d in ipairs(forInPairs.wrapBareIterators(targetText)) do
                 targetDiffs[#targetDiffs + 1] = d
             end
-            local transformedTarget = smerger.mergeDiff(targetText, mergeSameStartDiffs(targetDiffs))
+            local transformedTarget = smerger.mergeDiff(targetText, resolveOverlappingDiffs(mergeSameStartDiffs(targetDiffs)))
             diffs[#diffs + 1] = {
                 start  = 1,
                 finish = 0,
@@ -157,41 +193,73 @@ function OnSetText(uri, text)
         end
     end
 
-    local exports, hasTopReturn, topLevelLocalCount = exportEnv.scan(text)
+    local exports, hasTopReturn, topLevelLocalCount, unsafeNames = exportEnv.scan(text)
     if #exports > 0 and not hasTopReturn then
-        -- Every name here becomes a real `local`, and Lua 5.1 caps a chunk at 200 active
-        -- locals - splitting into more `local` statements doesn't help, the cap is on the
-        -- total, not per-statement, and it's the file's *combined* total (our added exports
-        -- PLUS whatever top-level locals it already had) that matters, not #exports alone:
-        -- lua/ui/lobby/lobby.lua has only 108 bare exports (well under a 150-only threshold)
-        -- but 120 pre-existing top-level locals of its own, for a real total of 228 - verified
-        -- against the actual file before picking this threshold. A few FA files (EffectTemplates.lua:
-        -- 869 top-level table defs) are themselves already past 200 on their own, so above a safe
-        -- combined threshold we skip the local-ification and return plain globals instead -
-        -- import() consumers still resolve correctly, and in-file forward references should too
-        -- (globals aren't lexically scoped by position the way locals are - see the
-        -- vm.hasGlobalSets/compileAst research from when export-env.lua was first built) - we
-        -- just lose the belt-and-suspenders local-ification for that one file.
-        local MAX_TOTAL_TOP_LEVEL_LOCALS = 190
-        if (#exports + topLevelLocalCount) <= MAX_TOTAL_TOP_LEVEL_LOCALS then
-            diffs[#diffs + 1] = {
-                start  = 1,
-                finish = 0,
-                text   = 'local ' .. table.concat(exports, ', ') .. '\n',
-            }
-        end
-        local fields = {}
+        -- Turn the file into a classic module: `local M = {}`, every export becomes
+        -- `M.Name = ...`, `return M`. Unlike forward-declared locals, `M.Name` field
+        -- resolution isn't restricted to "last assignment before this textual position" - it
+        -- resolves correctly from inside an earlier-defined function's body too, and doesn't
+        -- consume any of Lua 5.1's 200-local-per-chunk budget (see export-env.lua's header for
+        -- the full reasoning and the vm.getTableValue verification behind it).
+        --
+        -- A name that's shadowed anywhere in the file (a local/param/loop-var of the same
+        -- name - `unsafeNames`, from exportEnv.scan) can't safely have every *reference*
+        -- rewritten to `M.Name`, since a text scanner can't otherwise tell which bare
+        -- occurrence means what inside that shadowing scope (confirmed real, not just
+        -- theoretical: lua/system/profile.lua's `checkpoint` export is shadowed by
+        -- `function checkpoint_to_table(checkpoint)`'s own parameter). Those names keep
+        -- today's exact behaviour instead - forward-declared as a real `local`, then bridged
+        -- into `M` with one `M.Name = Name` assignment before `return M` - so import()
+        -- consumers still see a single, consistent table either way. Verified empirically
+        -- negligible: 57 names total, across 24 files, in the whole fa repo's 102,668
+        -- top-level exports.
+        local safeNames = {}
+        local unsafeList = {}
         for _, name in ipairs(exports) do
-            fields[#fields + 1] = ('%s = %s'):format(name, name)
+            if unsafeNames[name] then
+                unsafeList[#unsafeList + 1] = name
+            else
+                safeNames[name] = true
+            end
         end
+
+        -- Appended to `diffs` BEFORE the reference-rewrite diffs below, not after: if the file's
+        -- very first byte is itself the start of a safe export's name (no leading comment/blank
+        -- line), both this diff and that name's own `M.`-prefix diff target the same position-1
+        -- insertion point, and mergeSameStartDiffs concatenates same-start diffs in append order -
+        -- this header must land first, or the output would start with `M.local M = {}...`.
+        local header = 'local M = {}\n'
+        if #unsafeList > 0 then
+            -- Same 200-local-cap safety margin as before, now scoped to just the unsafe
+            -- subset - in practice always small enough that this never trips.
+            local MAX_TOTAL_TOP_LEVEL_LOCALS = 190
+            if (#unsafeList + topLevelLocalCount) <= MAX_TOTAL_TOP_LEVEL_LOCALS then
+                header = header .. 'local ' .. table.concat(unsafeList, ', ') .. '\n'
+            end
+        end
+        diffs[#diffs + 1] = {
+            start  = 1,
+            finish = 0,
+            text   = header,
+        }
+
+        for _, diff in ipairs(exportEnv.rewriteReferences(text, safeNames)) do
+            diffs[#diffs + 1] = diff
+        end
+
+        local footer = { '\n' }
+        for _, name in ipairs(unsafeList) do
+            footer[#footer + 1] = ('M.%s = %s\n'):format(name, name)
+        end
+        footer[#footer + 1] = 'return M\n'
         diffs[#diffs + 1] = {
             start  = #text + 1,
             finish = #text,
-            text   = '\nreturn { ' .. table.concat(fields, ', ') .. ' }\n',
+            text   = table.concat(footer),
         }
     end
 
-    return mergeSameStartDiffs(diffs)
+    return resolveOverlappingDiffs(mergeSameStartDiffs(diffs))
 end
 
 -- import()/doscript() take root-relative paths like '/lua/sim/Weapon.lua', optionally without
