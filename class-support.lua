@@ -85,6 +85,43 @@ local function findPrecedingName(text, pos)
     return nameStart, text:sub(nameStart, nameEnd)
 end
 
+--- Checks whether a `---@class` line (any name) already sits in the contiguous block of
+--- comment lines immediately above `pos` - i.e. whether *this* statement already has a class
+--- doc, regardless of what name it uses. FA often names the doc differently than the
+--- assigned variable on purpose (e.g. `---@class EasyAIBrain: ...` directly above
+--- `AIBrain = Class(...) {...}`, specifically so multiple files' generic `AIBrain` locals
+--- don't collide globally) - relying only on "does a doc named after the variable exist
+--- anywhere in the file" misses that and injects a second, conflicting same-named class that
+--- merges fields across every file that hits this pattern. Walks backward line by line: a
+--- blank line or real code stops the scan (no doc found); a comment line that isn't
+--- `---@class` keeps walking (covers `---@field`/description lines that sit between
+--- `---@class` and the code, as in the real examples above).
+---@param text string
+---@param pos  integer
+---@return boolean
+local function hasImmediatePrecedingClassDoc(text, pos)
+    -- pos-1 is the newline separating the preceding line from `pos`'s own line; start the
+    -- scan at pos-2, the last character *of* that preceding line (off-by-one verified by hand:
+    -- text:sub(1, pos-1) always ends in that same separating newline, so `.*\n()` matches it
+    -- and returns pos itself, making text:sub(pos, pos-1) - the "current line" - empty).
+    local lineEnd = pos - 2
+    while lineEnd >= 1 do
+        local lineStart = text:sub(1, lineEnd):match('.*\n()') or 1
+        local line = text:sub(lineStart, lineEnd)
+        local trimmed = line:match('^%s*(.-)%s*$')
+        if trimmed == '' then
+            return false
+        elseif trimmed:match('^%-%-%-@class') then
+            return true
+        elseif trimmed:match('^%-%-') then
+            lineEnd = lineStart - 2
+        else
+            return false
+        end
+    end
+    return false
+end
+
 --- Splits a `(...)` argument-list body on top-level commas (paren/string aware).
 ---@param argsText string
 ---@return string[]
@@ -204,7 +241,10 @@ function M.stripWrappers(text)
                     }
 
                     local nameStart, className = findPrecedingName(text, wordStart)
-                    if className and not existingClassDocs[className] then
+                    if className
+                    and nameStart
+                    and not existingClassDocs[className]
+                    and not hasImmediatePrecedingClassDoc(text, nameStart) then
                         local doc
                         if bases and #bases > 0 then
                             doc = '---@class ' .. className .. ': ' .. table.concat(bases, ', ') .. '\n'
