@@ -9,7 +9,11 @@
 -- opaque (if generically-annotated) function call. So we strip the `ClassFn(...)` wrapper
 -- text entirely, leaving a plain `Name = { specs }`, and inject a `---@class Name: Bases`
 -- doc comment when the file doesn't already have one for that name - both are things LuaLS
--- already handles natively and reliably once the call is out of the way.
+-- already handles natively and reliably once the call is out of the way. Blanking the wrapper
+-- also erases the only reference to any bare-identifier base argument (`Class(NullShell) {}`),
+-- which would otherwise make its `local NullShell = ...` declaration look unused - a harmless
+-- `local _ = NullShell` keep-alive line is inserted alongside to prevent that (see the
+-- comment at its call site for why `_` specifically).
 --
 -- Known limitations: only the `Name = ClassFn(...) { ... }` assignment shape is handled
 -- (bare identifier target only, no dotted targets like `t.Name = ...`); an anonymous
@@ -86,6 +90,60 @@ local function findPrecedingName(text, pos)
         return nil
     end
     return nameStart, text:sub(nameStart, nameEnd)
+end
+
+--- If `local` immediately precedes `nameStart` as a whole word (i.e. `local Name = ...`),
+--- returns the position of that `local` instead - the TRUE start of the statement. Otherwise
+--- returns `nameStart` unchanged. Needed because findPrecedingName only ever returns the bare
+--- name's own position, never accounting for an optional `local` prefix - inserting a new
+--- statement right at `nameStart` when `local` precedes it produces `local <inserted>Name = ...`,
+--- i.e. a literal double `local` and a real syntax error (reproduced on
+--- lua/maui/layouthelpers.lua's `local LayouterAttributeEditor = Class(LayouterAttributeFont)
+--- {` - an internal, local-scoped helper class, not FA's usual bare-global export).
+---@param text      string
+---@param nameStart integer
+---@return integer
+local function findStatementStart(text, nameStart)
+    local j = nameStart - 1
+    while j >= 1 and text:sub(j, j):match('%s') do
+        j = j - 1
+    end
+    if j >= 5 and text:sub(j - 4, j) == 'local' then
+        local before = j - 5
+        if before < 1 or not text:sub(before, before):match('[%w_]') then
+            return j - 4
+        end
+    end
+    return nameStart
+end
+
+--- Walks backward from `pos` through a contiguous run of `--` comment lines (stopping at a
+--- blank line or real code - same walk as hasImmediatePrecedingClassDoc below), returning the
+--- start position of the topmost comment line in that run, or `pos` itself if no such block
+--- immediately precedes it. Lets a synthetic statement be inserted BEFORE any doc-comment block
+--- (hand-written or injected) instead of between it and the statement it documents, which would
+--- break a LuaDoc annotation's "immediately precedes" binding requirement - see the base-class
+--- keep-alive in stripWrappers below for why that matters here.
+---@param text string
+---@param pos  integer
+---@return integer
+local function findCommentBlockStart(text, pos)
+    local boundary = pos
+    local lineEnd = pos - 2
+    while lineEnd >= 1 do
+        local lineStart = text:sub(1, lineEnd):match('.*\n()') or 1
+        local line = text:sub(lineStart, lineEnd)
+        local trimmed = line:match('^%s*(.-)%s*$')
+        if trimmed == '' then
+            break
+        elseif trimmed:match('^%-%-') then
+            boundary = lineStart
+            lineEnd = lineStart - 2
+        else
+            break
+        end
+    end
+    return boundary
 end
 
 --- Checks whether a `---@class` line (any name) already sits in the contiguous block of
@@ -196,6 +254,13 @@ function M.stripWrappers(text)
     local diffs = {}
     local lastWord = nil
     local prevChar = nil
+    -- Counts ONLY '{'/'}' - tells us whether we're inside some table constructor's field list,
+    -- where a synthetic *statement* (the base-class keep-alive below) can never legally go, vs
+    -- a real statement context (top level, or inside a function/if/for/while/do body - all of
+    -- which allow statements). The blanking/doc-injection logic below stays depth-independent
+    -- on purpose (already correct for nested classes, e.g. a class nested in another's spec
+    -- table); only the keep-alive needs this.
+    local braceDepth = 0
 
     local existingClassDocs = {}
     for name in text:gmatch('%-%-%-@class%s+([%a_][%w_%.]*)') do
@@ -242,6 +307,7 @@ function M.stripWrappers(text)
                 k = we1 + 1
 
                 local bases = nil
+                local rawBases = nil
                 if text:sub(k, k) == '(' then
                     local depth = 0
                     local j = k
@@ -260,7 +326,7 @@ function M.stripWrappers(text)
                         j = j + 1
                     end
                     if j <= n then
-                        local rawBases = splitTopLevelArgs(text:sub(k + 1, j - 1))
+                        rawBases = splitTopLevelArgs(text:sub(k + 1, j - 1))
                         bases = {}
                         for _, raw in ipairs(rawBases) do
                             local sanitized = sanitizeBase(raw)
@@ -284,10 +350,59 @@ function M.stripWrappers(text)
                     }
 
                     local nameStart, className = findPrecedingName(text, wordStart)
+                    -- The TRUE start of the statement - accounts for an optional `local` prefix
+                    -- (`local Name = ClassFn(...)`, e.g. lua/maui/layouthelpers.lua's internal
+                    -- helper classes) that `nameStart` alone doesn't. Both insertions below use
+                    -- this, not `nameStart` directly, to avoid landing between `local` and the
+                    -- name it declares.
+                    local statementStart = nameStart and findStatementStart(text, nameStart)
+
+                    -- Blanking `ClassFn(Bases...)` above erases the only reference to a
+                    -- bare-identifier base like `NullShell` from LuaLS's view - if it came from
+                    -- a `local NullShell = ...` declaration, that local now looks unused
+                    -- (confirmed real: effects/**/*_script.lua files routinely do
+                    -- `local NullShell = import(...).NullShell` then `Class(NullShell) {...}` -
+                    -- and it's common: 324/600 files in a random fa-repo sample hit this). A
+                    -- harmless `local _ = NullShell` right before the class statement "reads" it
+                    -- again - `_` is itself exempt from the unused-local check
+                    -- (script/core/diagnostics/unused-local.lua checks `name == '_'` and skips),
+                    -- so this satisfies the original local without ever tripping its own
+                    -- warning. Inserted at the *top* of any immediately-preceding comment block
+                    -- (findCommentBlockStart), not at statementStart directly - otherwise it
+                    -- would land between an existing hand-written `---@class` doc and the class
+                    -- statement it documents, breaking that doc's binding.
+                    --
+                    -- Only at braceDepth 0: `OnState = State(Shield.OnState) {...}` nested as a
+                    -- FIELD inside an outer class's own table constructor (a self-referential
+                    -- state-override pattern, confirmed real: lua/shield.lua:1135) has no legal
+                    -- place for a synthetic *statement* - a table constructor's field list only
+                    -- accepts `[expr]=v`/`name=v`/`v` entries, never a `local` statement.
+                    -- Reproduced: inserting one there produced "<keyword> cannot be used as
+                    -- name" (the parser hitting `local` where a field name was expected). Nested
+                    -- bases also don't need the keep-alive in the first place - they're
+                    -- typically dotted references into the very class being defined
+                    -- (`Shield.OnState`), not a separate local at risk of going unused.
+                    if statementStart and rawBases and braceDepth == 0 then
+                        local keepAlive = {}
+                        for _, raw in ipairs(rawBases) do
+                            if isSimpleTypeName(raw) then
+                                keepAlive[#keepAlive + 1] = 'local _ = ' .. raw
+                            end
+                        end
+                        if #keepAlive > 0 then
+                            local insertAt = findCommentBlockStart(text, statementStart)
+                            diffs[#diffs + 1] = {
+                                start  = insertAt,
+                                finish = insertAt - 1,
+                                text   = table.concat(keepAlive, '; ') .. '\n',
+                            }
+                        end
+                    end
+
                     if className
-                    and nameStart
+                    and statementStart
                     and not existingClassDocs[className]
-                    and not hasImmediatePrecedingClassDoc(text, nameStart) then
+                    and not hasImmediatePrecedingClassDoc(text, statementStart) then
                         local doc
                         if bases and #bases > 0 then
                             doc = '---@class ' .. className .. ': ' .. table.concat(bases, ', ') .. '\n'
@@ -295,8 +410,8 @@ function M.stripWrappers(text)
                             doc = '---@class ' .. className .. '\n'
                         end
                         diffs[#diffs + 1] = {
-                            start  = nameStart,
-                            finish = nameStart - 1,
+                            start  = statementStart,
+                            finish = statementStart - 1,
                             text   = doc,
                         }
                         existingClassDocs[className] = true
@@ -306,6 +421,18 @@ function M.stripWrappers(text)
 
             lastWord = word
             prevChar = nil
+
+        elseif c == '{' then
+            braceDepth = braceDepth + 1
+            prevChar = nil
+            lastWord = nil
+            i = i + 1
+
+        elseif c == '}' then
+            braceDepth = math.max(0, braceDepth - 1)
+            prevChar = nil
+            lastWord = nil
+            i = i + 1
 
         else
             prevChar = (c == '.' or c == ':') and c or nil
