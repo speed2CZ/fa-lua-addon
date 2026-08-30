@@ -1,3 +1,6 @@
+-- Makes FA's `Class()`-family OOP sugar readable as a real class to LuaLS, by stripping the
+-- wrapper call down to a plain table and adding the `---@class` doc it implies.
+--
 -- FA classes are defined as `Name = ClassFn(Base1, Base2, ...) { specs }` (or the no-base
 -- `Name = ClassFn { specs }` form), per lua/system/class.lua. Even though class.lua carries
 -- `---@generic T / @param specs T / @return T` annotations aimed at propagating the spec

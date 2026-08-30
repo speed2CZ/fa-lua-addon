@@ -1,6 +1,9 @@
--- SupCom's Lua preprocessor treats `#` as a comment-start (equivalent to `--`), which isn't
--- valid standard Lua syntax, so it has to be blanked out before parsing. But `#` outside of
--- that convention is still an ordinary character: it appears inside 171+ real FA string
+-- Converts SupCom's `#` comment marker into standard Lua `--`, without touching a `#` that's
+-- just an ordinary character.
+--
+-- SupCom's Lua preprocessor treats a bare `#` as a comment-start (equivalent to `--`), which
+-- isn't valid standard Lua syntax, so it has to be blanked out before parsing. But `#` outside
+-- of that convention is still an ordinary character: it appears inside 171+ real FA string
 -- literals (confirmed, e.g. shared/DebugFunction.lua:101's `"%0#" .. ...` format-width
 -- pattern, and dozens of changelog strings literally starting `"# Patch ..."`), and inside
 -- already-valid `--` comments, including `--#region`/`--#endregion` folding markers

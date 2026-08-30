@@ -1,3 +1,6 @@
+-- Types SupCom's bare-table `for` loops by giving LuaLS a real iterator call to read a
+-- signature from.
+--
 -- SupCom's engine lets `for a, b in someTable do ... end` iterate a bare table directly
 -- (confirmed: same semantics as pairs()) - no pairs()/ipairs()/custom iterator call needed.
 -- That's not a parse error (a bare table is a perfectly valid `in`-clause expression

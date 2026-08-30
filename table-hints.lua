@@ -1,8 +1,11 @@
+-- Strips SupCom's `{&N &N ...}` table-preallocation hints, which aren't valid Lua 5.1 syntax
+-- at all.
+--
 -- SupCom's Lua fork allows a table constructor to start with preallocation hints,
 -- e.g. `{&15 &4}` = preallocate 15 hash-part slots, 4 array-part slots. `&` isn't a
 -- Lua 5.1 token at all (no bitwise operators in 5.1), so this is a genuine parse
 -- error, not just a diagnostic - has to be stripped from the source text before the
--- real parser ever sees it, same as the `#` macro handling.
+-- real parser ever sees it, same as the `#` comment handling.
 --
 -- Assumed grammar (only a prefix, right after `{`; count and separator can vary):
 -- one or more `&<digits>` tokens, each optionally followed by whitespace and/or a

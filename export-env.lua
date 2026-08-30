@@ -1,14 +1,21 @@
--- Heuristic pre-parse scanner (not a real parser): finds FA's bare top-level
--- declarations (`Name = ...` / `function Name(...)`, no `local` keyword) and rewrites the
--- whole file into a classic Lua module: `local M = {}`, every export becomes `M.Name = ...`,
--- and the file ends with `return M`. That's what makes forward/mutual references between
--- exports resolve correctly, including from *inside* an earlier-defined function's body: `M`
--- itself is assigned exactly once (`local M = {}`), so its own local-scoping is trivially
--- unambiguous regardless of where in the file it's referenced from, and `M.Name` field
--- resolution (unlike a bare local) isn't restricted to "last assignment before this textual
--- position" - LuaLS resolves it by merging every known `M.Name = ...` in the file, wherever it
--- sits. This also sidesteps Lua 5.1's 200-local-per-chunk cap entirely for exported names,
--- since table fields don't consume it - only forward-declared *unsafe* names (see below) do.
+-- Makes FA's implicit module system visible to LuaLS: finds each file's bare top-level
+-- declarations and rewrites the file into a real Lua module, so every export resolves
+-- correctly wherever it's referenced from - including forward references, from inside a
+-- function defined earlier in the same file.
+--
+-- This is a heuristic pre-parse scanner, not a real parser. FA files never `return {...}` - a
+-- file's bare top-level assignments and functions (no `local` keyword), such as
+-- `Name = ...` / `function Name(...)`, ARE its exports, resolved by `import()` at runtime. We
+-- rewrite the whole file into a classic Lua module: `local M = {}`, every export reachable as
+-- `M.Name`, and the file ends with `return M`. That's what makes forward/mutual references
+-- between exports resolve correctly, including from *inside* an earlier-defined function's
+-- body: `M` itself is assigned exactly once (`local M = {}`), so its own local-scoping is
+-- trivially unambiguous regardless of where in the file it's referenced from, and `M.Name`
+-- field resolution (unlike a bare local) isn't restricted to "last assignment before this
+-- textual position" - LuaLS resolves it by merging every known `M.Name = ...` in the file,
+-- wherever it sits. This also sidesteps Lua 5.1's 200-local-per-chunk cap entirely for exported
+-- names, since table fields don't consume it - only forward-declared *unsafe* names (see below)
+-- do.
 --
 -- Depth tracks both block keywords (function/if/do/repeat...end/until) AND `{`/`}`, since
 -- FA classes are one big table constructor (`Unit = ClassUnit(...) { Foo = function(self)

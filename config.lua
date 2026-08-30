@@ -1,3 +1,10 @@
+-- Applies the workspace settings FA's dialect needs but no scanner rewrites - SupCom-only
+-- tokens, engine globals, and require/path conventions - automatically to any matching project.
+--
+-- Loaded by LuaLS's third-party config system (script/library.lua) whenever the workspace name
+-- or an open file matches `words` below; each entry in `configs` is then applied to the user's
+-- own settings once, the first time a match is found.
+
 -- if not set, the folder name will be used
 name    = 'Forged Alliance'
 -- match any word to load

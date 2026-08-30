@@ -1,3 +1,17 @@
+-- Orchestrates every SupCom-Lua-to-standard-Lua translation this addon performs, and wires the
+-- addon into LuaLS as a workspace plugin.
+--
+-- Each dialect quirk (comments, table hints, classes, bare iteration, the implicit module
+-- system, mod hook files) has its own scanner module, each returning a list of
+-- `{start, finish, text}` diffs against the *original* source text - see that module's own
+-- header for what it solves and why. `OnSetText` below runs every scanner over each file LuaLS
+-- opens, merges their diffs into one list, and hands LuaLS the merged result to parse instead
+-- of the raw file. Merging independently-computed diffs safely - two scanners agreeing on the
+-- same position, or one scanner's diff accidentally overlapping another's - turned out to need
+-- real care of its own; see `mergeSameStartDiffs` and `resolveOverlappingDiffs` below.
+-- `ResolveRequire` separately teaches LuaLS to follow FA's root-relative `import()`/
+-- `doscript()` paths.
+
 local files        = require 'files'
 local furi         = require 'file-uri'
 local smerger      = require 'string-merger'
@@ -104,25 +118,11 @@ local function resolveOverlappingDiffs(diffs)
     return result
 end
 
--- FA's Lua preprocessor treats `#` as a comment-start, which isn't valid standard Lua syntax;
--- hash-comments.lua blanks it out - carefully, since a blind replace corrupts string literals
--- containing '#' and breaks --#region/--#endregion folding markers (both confirmed real).
--- FA modules also don't `return {...}`: a file's bare top-level assignments/functions (no
--- `local` keyword) ARE its exports, resolved at runtime by import(). We reproduce that here
--- as a real Lua module - `local M = {}`, every export rewritten to `M.Name = ...` (definition
--- *and* every reference), `return M` at the bottom - rather than patching the AST after
--- parsing, because forward/mutual references between exports only resolve correctly if the
--- *parser* sees the real `M.Name` field assignments; a post-parse transform is too late to
--- change how names already resolved. See export-env.lua for why this fixes forward-references
--- from inside an earlier-defined function's body (which forward-declared locals alone can't)
--- and why a small, empirically-measured subset of shadowed names is deliberately left alone.
--- Table constructors can also start with `{&15 &4}`-style preallocation hints, which aren't
--- valid Lua 5.1 syntax at all - table-hints.lua blanks those out the same way. FA classes
--- (`Name = ClassFn(Bases...) { specs }`) don't register their methods as class members unless
--- the `ClassFn(...)` wrapper is stripped down to a plain `Name = { specs }` first - see
--- class-support.lua. And `for a, b in someTable do` (no pairs()/ipairs()) is valid syntax
--- SupCom's engine gives pairs()-like semantics to, but LuaLS can't type it without an actual
--- call to read a signature off of - for-in-pairs.lua rewrites it to `in pairs(someTable) do`.
+--- Runs every scanner over `text` (hash-comments, table-hints, class-support, for-in-pairs, in
+--- that order - see each module's own header for what it fixes), then export-env's module-wrap
+--- pass, then merges everything into one diff list for LuaLS to apply. Order only matters where
+--- two scanners could plausibly touch the same text; otherwise each runs independently against
+--- the *original* `text`, never against another scanner's output.
 ---@param  uri  string
 ---@param  text string
 ---@return nil|fa.diff[]

@@ -1,3 +1,6 @@
+-- Identifies which target file a SupCom mod "hook" file extends, so plugin.lua can stitch the
+-- two together before LuaLS sees either.
+--
 -- SupCom mods can define "hook" files under a mod's hookdir (a folder mirroring the game's own
 -- file structure - MODS.LUA:150-198, default `/hook`, configurable per-mod). After the target
 -- script loads, a matching hook file's content is concatenated to the END of it, and the
