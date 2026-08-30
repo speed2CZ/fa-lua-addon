@@ -1,13 +1,19 @@
 # fa-lua-addon
 
 A [lua-language-server](https://github.com/LuaLS/lua-language-server) workspace plugin that
-teaches LuaLS to read Supreme Commander: Forged Alliance's Lua dialect. SupCom's Lua fork bends
-standard Lua 5.1 in several ways - a preprocessor comment marker, table-size hints, an OOP call
-convention, an implicit module system - none of it valid standard Lua. This addon rewrites each
-quirk into something LuaLS already understands, in the source text, before the real parser ever
-sees it. It's a from-scratch replacement for the outdated
+teaches LuaLS to read Supreme Commander: Forged Alliance's Lua dialect. SupCom actually runs a
+GPG-modified **Lua 5.0** - confirmed by [FAForever/lua-lang](https://github.com/FAForever/lua-lang),
+a buildable reference implementation of it - and that modified dialect bends the language in
+several ways: a preprocessor comment marker, table-size hints, an OOP call convention, an
+implicit module system - none of it valid standard Lua. This addon rewrites each quirk into
+something LuaLS already understands, in the source text, before the real parser ever sees it.
+It's a from-scratch replacement for the outdated
 [FAForever/fa-lua-language-server](https://github.com/FAForever/fa-lua-language-server) fork,
 built as a plugin against mainline LuaLS instead of a fork of it.
+
+The addon still configures `Lua.runtime.version = 'Lua 5.1'`, not 5.0: LuaLS doesn't support a
+5.0 runtime at all, and 5.1 is both the earliest version it does support and the closest one to
+SupCom's actual dialect.
 
 ## Setup
 
