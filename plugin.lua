@@ -127,6 +127,20 @@ end
 ---@param  text string
 ---@return nil|fa.diff[]
 function OnSetText(uri, text)
+    -- Computed up front, before classSupport runs, because it needs to know which bare names
+    -- are this file's own exports - see the comment on the base-class keep-alive inside
+    -- class-support.lua's stripWrappers for why.
+    local exports, hasTopReturn, topLevelLocalCount, unsafeNames = exportEnv.scan(text)
+    local safeNames = {}
+    local unsafeList = {}
+    for _, name in ipairs(exports) do
+        if unsafeNames[name] then
+            unsafeList[#unsafeList + 1] = name
+        else
+            safeNames[name] = true
+        end
+    end
+
     local diffs = {}
     for _, diff in ipairs(hashComments.stripHashComments(text)) do
         diffs[#diffs + 1] = diff
@@ -136,7 +150,7 @@ function OnSetText(uri, text)
         diffs[#diffs + 1] = diff
     end
 
-    for _, diff in ipairs(classSupport.stripWrappers(text)) do
+    for _, diff in ipairs(classSupport.stripWrappers(text, safeNames)) do
         diffs[#diffs + 1] = diff
     end
 
@@ -193,7 +207,6 @@ function OnSetText(uri, text)
         end
     end
 
-    local exports, hasTopReturn, topLevelLocalCount, unsafeNames = exportEnv.scan(text)
     if #exports > 0 and not hasTopReturn then
         -- Turn the file into a classic module: `local M = {}`, every export becomes
         -- `M.Name = ...`, `return M`. Unlike forward-declared locals, `M.Name` field
@@ -213,15 +226,9 @@ function OnSetText(uri, text)
         -- consumers still see a single, consistent table either way. Verified empirically
         -- negligible: 57 names total, across 24 files, in the whole fa repo's 102,668
         -- top-level exports.
-        local safeNames = {}
-        local unsafeList = {}
-        for _, name in ipairs(exports) do
-            if unsafeNames[name] then
-                unsafeList[#unsafeList + 1] = name
-            else
-                safeNames[name] = true
-            end
-        end
+        --
+        -- `safeNames`/`unsafeList` were already computed at the top of this function (before
+        -- classSupport ran, which needs `safeNames` too).
 
         -- Appended to `diffs` BEFORE the reference-rewrite diffs below, not after: if the file's
         -- very first byte is itself the start of a safe export's name (no leading comment/blank

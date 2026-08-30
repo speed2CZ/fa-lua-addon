@@ -13,7 +13,8 @@
 -- also erases the only reference to any bare-identifier base argument (`Class(NullShell) {}`),
 -- which would otherwise make its `local NullShell = ...` declaration look unused - a harmless
 -- `local _ = NullShell` keep-alive line is inserted alongside to prevent that (see the
--- comment at its call site for why `_` specifically).
+-- comment at its call site for why `_` specifically, and why it reads `M.Name` instead of the
+-- bare name when the base is one of the file's own exports).
 --
 -- Known limitations: only the `Name = ClassFn(...) { ... }` assignment shape is handled
 -- (bare identifier target only, no dotted targets like `t.Name = ...`); an anonymous
@@ -227,6 +228,20 @@ local function isSimpleTypeName(s)
     return true
 end
 
+--- Returns the identifier before the first `.` in a dotted chain (or the whole string, if
+--- there's no dot) - e.g. `"Shield.OnState"` -> `"Shield"`. Used to decide whether a base's
+--- keep-alive (see stripWrappers below) needs an `M.` prefix: only the base's own OUTERMOST
+--- name can possibly be one of this file's own exports.
+---@param s string
+---@return string
+local function firstSegment(s)
+    local dot = s:find('.', 1, true)
+    if dot then
+        return s:sub(1, dot - 1)
+    end
+    return s
+end
+
 --- Classifies a raw `Class(...)` base-argument's source text into something usable in a
 --- `---@class X: Base` doc. Only a bare type-name (dotted-identifier chain, e.g.
 --- `moho.unit_methods`) is a valid LuaLS type reference; anything else - a call, indexing on a
@@ -246,9 +261,16 @@ local function sanitizeBase(baseText)
     return baseText:match('^import%s*%b()%.([%a_][%w_]*)$')
 end
 
----@param text string
+--- `safeNames` is the set of this file's own bare top-level exports that export-env.lua will
+--- rewrite *every* occurrence of (definition included) to `M.Name` - see the base-class
+--- keep-alive below for why stripWrappers needs to know this. Pass an empty table (or omit) for
+--- text that never goes through export-env's rewrite at all (e.g. a hook file's stitched
+--- target - see plugin.lua's OnSetText).
+---@param text       string
+---@param safeNames? table<string, boolean>
 ---@return fa.diff[]
-function M.stripWrappers(text)
+function M.stripWrappers(text, safeNames)
+    safeNames = safeNames or {}
     local n = #text
     local i = 1
     local diffs = {}
@@ -372,6 +394,16 @@ function M.stripWrappers(text)
                     -- would land between an existing hand-written `---@class` doc and the class
                     -- statement it documents, breaking that doc's binding.
                     --
+                    -- If the base's own outermost name is one of THIS file's exports (`safeNames`),
+                    -- export-env.lua rewrites *every* occurrence of it - including its own
+                    -- definition - to `M.Name`, so the bare name never exists anywhere in the
+                    -- transformed output; the keep-alive has to read `M.Name` instead, or it
+                    -- becomes an undefined-global itself (confirmed real:
+                    -- lua/terranprojectiles.lua's `TDFGaussCannonProjectile = ClassProjectile(
+                    -- TDFGeneralGaussCannonProjectile) {...}`, where the base is this same
+                    -- file's own earlier-defined class). An imported/non-exported local (like
+                    -- `NullShell` above) isn't in `safeNames` and keeps the bare reference.
+                    --
                     -- Only at braceDepth 0: `OnState = State(Shield.OnState) {...}` nested as a
                     -- FIELD inside an outer class's own table constructor (a self-referential
                     -- state-override pattern, confirmed real: lua/shield.lua:1135) has no legal
@@ -386,7 +418,11 @@ function M.stripWrappers(text)
                         local keepAlive = {}
                         for _, raw in ipairs(rawBases) do
                             if isSimpleTypeName(raw) then
-                                keepAlive[#keepAlive + 1] = 'local _ = ' .. raw
+                                if safeNames[firstSegment(raw)] then
+                                    keepAlive[#keepAlive + 1] = 'local _ = M.' .. raw
+                                else
+                                    keepAlive[#keepAlive + 1] = 'local _ = ' .. raw
+                                end
                             end
                         end
                         if #keepAlive > 0 then
