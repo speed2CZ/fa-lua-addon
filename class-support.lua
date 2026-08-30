@@ -143,7 +143,12 @@ end
 ---@return integer
 local function findCommentBlockStart(text, pos)
     local boundary = pos
-    local lineEnd = pos - 2
+    -- `pos` itself may be indented (any nested class field, e.g. `    RackSalvoChargeState =
+    -- State {`) - `pos - 2` alone would land inside THAT indentation rather than the actual
+    -- previous line, misreading it as blank. Find pos's own line start first (tolerating its
+    -- indentation), then step back over the newline before it to reach the true previous line.
+    local ownLineStart = text:sub(1, pos - 1):match('.*\n()') or 1
+    local lineEnd = ownLineStart - 2
     while lineEnd >= 1 do
         local lineStart = text:sub(1, lineEnd):match('.*\n()') or 1
         local line = text:sub(lineStart, lineEnd)
@@ -175,11 +180,22 @@ end
 ---@param pos  integer
 ---@return boolean
 local function hasImmediatePrecedingClassDoc(text, pos)
-    -- pos-1 is the newline separating the preceding line from `pos`'s own line; start the
-    -- scan at pos-2, the last character *of* that preceding line (off-by-one verified by hand:
-    -- text:sub(1, pos-1) always ends in that same separating newline, so `.*\n()` matches it
-    -- and returns pos itself, making text:sub(pos, pos-1) - the "current line" - empty).
-    local lineEnd = pos - 2
+    -- Same indentation pitfall as findCommentBlockStart above: find pos's own line start first
+    -- (tolerating its indentation), then step back over the newline before it to reach the true
+    -- previous line, instead of assuming pos sits at column 1. Confirmed real:
+    -- lua/sim/weapons/DefaultProjectileWeapon.lua's `    RackSalvoChargeState = State {` (an
+    -- indented field, already hand-annotated with `---@class
+    -- DefaultProjectileWeapon_RackSalvoChargeState : DefaultProjectileWeapon, State` directly
+    -- above it) - assuming pos-2 landed on the doc line, when it actually landed inside
+    -- RackSalvoChargeState's own leading indentation, misread as a blank line. That made this
+    -- return false, so stripWrappers injected a second, competing, base-less `---@class
+    -- RackSalvoChargeState` doc that (being textually closer) won the LuaDoc binding over the
+    -- real one - losing the `: State` relationship entirely and breaking `ChangeState(self,
+    -- self.RackSalvoChargeState)`'s type check ("Cannot assign RackSalvoChargeState to parameter
+    -- State"). Top-level (unindented) statements were never affected - there, pos already sits
+    -- at column 1, so ownLineStart below equals pos and this is a no-op.
+    local ownLineStart = text:sub(1, pos - 1):match('.*\n()') or 1
+    local lineEnd = ownLineStart - 2
     while lineEnd >= 1 do
         local lineStart = text:sub(1, lineEnd):match('.*\n()') or 1
         local line = text:sub(lineStart, lineEnd)
