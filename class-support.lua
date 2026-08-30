@@ -16,7 +16,14 @@
 -- comment at its call site for why `_` specifically, and why it reads `M.Name` instead of the
 -- bare name when the base is one of the file's own exports). A base that's itself a local
 -- import-alias with a different name than what it holds (`local Foo = Module.Bar`, then
--- `Class(Foo)`) gets resolved to `Bar` for the doc specifically - see buildAliasMap.
+-- `Class(Foo)`) gets resolved to `Bar` for the doc specifically - see buildReferenceMaps. A
+-- NESTED class (one inside another class's own spec table, e.g. a state override) is named
+-- `<enclosing top-level class>_<field name>` rather than the bare field name, matching FA's own
+-- hand-written convention (`DefaultProjectileWeapon_IdleState`) - this both avoids every file's
+-- undocumented same-named nested state (`IdleState`, `Start`, ...) merging into one shared
+-- global type, and lets an `Owner.Field` base reference (`State(DefaultBeamWeapon.IdleState)`,
+-- FA's own "override the parent's state" pattern) resolve to exactly that name - see
+-- sanitizeBase/buildReferenceMaps.
 --
 -- Known limitations: only the `Name = ClassFn(...) { ... }` assignment shape is handled
 -- (bare identifier target only, no dotted targets like `t.Name = ...`); an anonymous
@@ -271,28 +278,46 @@ local function firstSegment(s)
     return s
 end
 
---- Scans for TOP-LEVEL `local Alias = RHS` declarations where RHS is either `import(...).Name`
+--- One pass, extending the original alias-only scan, collecting THREE maps used to resolve a
+--- Class()/State() base argument (see sanitizeBase below):
+---
+--- `aliasMap`: TOP-LEVEL `local Alias = RHS` declarations where RHS is either `import(...).Name`
 --- or a bare dotted-identifier chain not immediately followed by `(` (a real reference, not a
---- function call), and resolves to a canonical name that differs from Alias's own - i.e. cases
---- where FA renamed an import at the point of use. Depth-tracked (block keywords + braces, same
---- shape as export-env.lua's own scan) so nested function-body locals - which commonly look
---- like `local brain = self` or `local bp = unit.Enhancements` and have nothing to do with
---- file-level import aliasing - are never mistaken for one; Lua keywords (`local dialog =
---- false`) are excluded from being treated as a type name either as the alias or the resolved
---- name. See sanitizeBase below for why this matters: confirmed real on
---- units/XSL0001/XSL0001_script.lua, where `local SDFChronotronOverChargeCannonWeapon =
---- SWeapons.SDFChronotronCannonOverChargeWeapon` is later used as a Class() base by its own
---- (differently-spelled) name - the real, registered type is `SDFChronotronCannonOverChargeWeapon`
---- (confirmed: lua/seraphimweapons.lua's own export uses that exact spelling), so injecting the
---- local's own name into the doc produces "Undefined class".
+--- function call), resolved to a canonical name that differs from Alias's own - i.e. cases where
+--- FA renamed an import at the point of use. Depth-tracked (block keywords + braces, same shape
+--- as export-env.lua's own scan) so nested function-body locals - which commonly look like
+--- `local brain = self` or `local bp = unit.Enhancements` and have nothing to do with file-level
+--- import aliasing - are never mistaken for one; Lua keywords (`local dialog = false`) are
+--- excluded from being treated as a type name either as the alias or the resolved name.
+--- Confirmed real on units/XSL0001/XSL0001_script.lua, where `local
+--- SDFChronotronOverChargeCannonWeapon = SWeapons.SDFChronotronCannonOverChargeWeapon` is later
+--- used as a Class() base by its own (differently-spelled) name - the real, registered type is
+--- `SDFChronotronCannonOverChargeWeapon` (confirmed: lua/seraphimweapons.lua's own export uses
+--- that exact spelling), so injecting the local's own name into the doc produces "Undefined
+--- class".
+---
+--- `moduleImports`: names bound via `local X = import(path)` with NO trailing `.Name` - a WHOLE
+--- MODULE table (e.g. `local SWeapon = import("/lua/seraphimweapons.lua")`). Distinguishes a
+--- module-table reference (`X.Field` means "the module's own top-level export Field") from a
+--- class reference below.
+---
+--- `classOwners`: names bound via `local X = import(path).Name` (a SINGLE class import, e.g.
+--- `local DefaultProjectileWeapon = import(...).DefaultProjectileWeapon`) OR a bare top-level
+--- `X = ClassFn(...) { ... }` defined in this same file (a self-reference, e.g. `Shield =
+--- ClassShield(...) { ... OnState = State(Shield.OnState) {...} ... }` in lua/shield.lua,
+--- confirmed real). For these, `X.Field` means "X's own nested Field state" - see sanitizeBase.
 ---@param text string
----@return table<string, string>
-local function buildAliasMap(text)
+---@return table<string, string>  aliasMap
+---@return table<string, boolean> moduleImports
+---@return table<string, boolean> classOwners
+local function buildReferenceMaps(text)
     local n = #text
     local i = 1
     local depth = 0
     local loopHeaderDepth = 0
     local aliasMap = {}
+    local moduleImports = {}
+    local classOwners = {}
     while i <= n do
         local c = text:sub(i, i)
         if c == '-' and text:sub(i, i + 1) == '--' then
@@ -310,6 +335,7 @@ local function buildAliasMap(text)
         elseif c == '[' then
             i = skipLongBracket(text, i, n) or (i + 1)
         elseif c:match('[%a_]') then
+            local wordStart = i
             local _, e, word = text:find('^([%a_][%w_]*)', i)
             i = e + 1
 
@@ -330,9 +356,14 @@ local function buildAliasMap(text)
                     local _, afterEqEnd = text:find('^%s*[%a_][%w_]*%s*=%s*', i)
                     local afterEq = afterEqEnd + 1
                     local canonical = nil
-                    local importName = text:match('^import%s*%b()%.([%a_][%w_]*)', afterEq)
-                    if importName then
-                        canonical = importName
+                    if text:match('^import%s*%b()', afterEq) then
+                        local importName = text:match('^import%s*%b()%.([%a_][%w_]*)', afterEq)
+                        if importName then
+                            canonical = importName
+                            classOwners[aliasName] = true
+                        else
+                            moduleImports[aliasName] = true
+                        end
                     else
                         local rhs = text:match('^[%a_][%w_%.]*', afterEq)
                         if rhs and isSimpleTypeName(rhs) and not KEYWORDS[firstSegment(rhs)] then
@@ -351,6 +382,20 @@ local function buildAliasMap(text)
                         aliasMap[aliasName] = canonical
                     end
                 end
+            elseif CLASS_FUNCTIONS[word] and depth == 0 and loopHeaderDepth == 0 then
+                -- A bare top-level `X = ClassFn(...) { ... }` in THIS file self-defines a class
+                -- owner - same word/preceding-name checks stripWrappers itself uses below.
+                local j = wordStart - 1
+                while j >= 1 and text:sub(j, j):match('%s') do
+                    j = j - 1
+                end
+                local prevChar = j >= 1 and text:sub(j, j) or nil
+                if prevChar ~= '.' and prevChar ~= ':' then
+                    local _, className = findPrecedingName(text, wordStart)
+                    if className then
+                        classOwners[className] = true
+                    end
+                end
             end
         elseif c == '{' then
             depth = depth + 1
@@ -362,7 +407,7 @@ local function buildAliasMap(text)
             i = i + 1
         end
     end
-    return aliasMap
+    return aliasMap, moduleImports, classOwners
 end
 
 --- Classifies a raw `Class(...)` base-argument's source text into something usable in a
@@ -376,17 +421,42 @@ end
 --- safe even when wrong (a missing inherited-member completion, not a new diagnostic). Anything
 --- else unrecognised is dropped rather than guessed at.
 ---
---- `aliasMap` (from buildAliasMap) is checked first: if `baseText` is itself a local alias for
---- something with a different canonical name, that canonical name is used instead - see
---- buildAliasMap's own comment for the real example this fixes.
+--- `aliasMap` (from buildReferenceMaps) is checked first: if `baseText` is itself a local alias
+--- for something with a different canonical name, that canonical name is used instead - see
+--- buildReferenceMaps' own comment for the real example this fixes.
+---
+--- Otherwise, if `baseText` is a dotted `Owner.Field` chain, `moduleImports`/`classOwners` (also
+--- from buildReferenceMaps) decide what it means: a module-table export access
+--- (`SWeapon.SDFShriekerCannon` -> `SDFShriekerCannon`, dropping the module prefix - same
+--- resolution as the `import(...).Name` handling below, just via a pre-bound local instead of an
+--- inline call) or a nested state/class override (`DefaultBeamWeapon.IdleState` ->
+--- `DefaultBeamWeapon_IdleState`, dots replaced with underscores - matching the SAME
+--- owner-qualified naming stripWrappers below now uses for its own auto-generated nested-class
+--- docs, so a reference from another file resolves to exactly what the owner's own file
+--- produces, with no need to read that file). Confirmed real: lua/sim/weapons/cybran/
+--- CAMZapperWeapon.lua's `State(DefaultBeamWeapon.IdleState)` and lua/shield.lua's
+--- self-referential `State(Shield.OnState)` (Shield.lua's own `Shield = ClassShield(...) {...}`
+--- makes `Shield` a classOwner of itself). Neither map matching (e.g. `moho.unit_methods`, a
+--- genuine namespaced engine type, never a local import) falls through to the dotted text
+--- unchanged, same as before this resolution existed.
 ---@param baseText string
 ---@param aliasMap table<string, string>
+---@param moduleImports table<string, boolean>
+---@param classOwners table<string, boolean>
 ---@return string?
-local function sanitizeBase(baseText, aliasMap)
+local function sanitizeBase(baseText, aliasMap, moduleImports, classOwners)
     if aliasMap[baseText] then
         return aliasMap[baseText]
     end
     if isSimpleTypeName(baseText) then
+        local owner = firstSegment(baseText)
+        if owner ~= baseText then
+            if moduleImports[owner] then
+                return baseText:match('([%a_][%w_]*)$')
+            elseif classOwners[owner] then
+                return (baseText:gsub('%.', '_'))
+            end
+        end
         return baseText
     end
     return baseText:match('^import%s*%b()%.([%a_][%w_]*)$')
@@ -414,12 +484,17 @@ function M.stripWrappers(text, safeNames)
     -- on purpose (already correct for nested classes, e.g. a class nested in another's spec
     -- table); only the keep-alive needs this.
     local braceDepth = 0
+    -- Stack of top-level (braceDepth 0) class names currently "open" - only ever has 0 or 1
+    -- entries (a new top-level class only starts once the previous one has fully closed back to
+    -- braceDepth 0), used to owner-qualify any NESTED class doc this scan auto-generates. See
+    -- the docClassName computation below.
+    local topLevelStack = {}
 
     local existingClassDocs = {}
     for name in text:gmatch('%-%-%-@class%s+([%a_][%w_%.]*)') do
         existingClassDocs[name] = true
     end
-    local aliasMap = buildAliasMap(text)
+    local aliasMap, moduleImports, classOwners = buildReferenceMaps(text)
 
     while i <= n do
         local c = text:sub(i, i)
@@ -483,7 +558,7 @@ function M.stripWrappers(text, safeNames)
                         rawBases = splitTopLevelArgs(text:sub(k + 1, j - 1))
                         bases = {}
                         for _, raw in ipairs(rawBases) do
-                            local sanitized = sanitizeBase(raw, aliasMap)
+                            local sanitized = sanitizeBase(raw, aliasMap, moduleImports, classOwners)
                             if sanitized then
                                 bases[#bases + 1] = sanitized
                             end
@@ -567,22 +642,45 @@ function M.stripWrappers(text, safeNames)
                         end
                     end
 
-                    if className
+                    -- A NESTED class (braceDepth > 0, e.g. `IdleState = State {...}` inside
+                    -- `DefaultBeamWeapon`'s own spec table) gets its auto-generated doc name
+                    -- qualified with the innermost currently-open TOP-LEVEL class's own name -
+                    -- `DefaultBeamWeapon_IdleState`, not bare `IdleState` - matching FA's own
+                    -- hand-written convention for nested state overrides (e.g.
+                    -- `DefaultProjectileWeapon_IdleState`). Without this, every file's
+                    -- undocumented nested `IdleState`/`Start`/`Error`/etc. shares the exact same
+                    -- bare global name, and LuaLS merges same-named classes workspace-wide (the
+                    -- very `AIBrain`/`EasyAIBrain` collision hasImmediatePrecedingClassDoc's own
+                    -- comment above already warns about) - silently smearing dozens of unrelated
+                    -- files' same-named nested states into one shared type. It also makes an
+                    -- `Owner.Field` base reference (see sanitizeBase) resolvable at all: nothing
+                    -- was ever registered under that dotted name before this. Top-level
+                    -- (braceDepth 0) classes are unaffected (docClassName == className).
+                    local docClassName = className
+                    if braceDepth > 0 and #topLevelStack > 0 and className then
+                        docClassName = topLevelStack[#topLevelStack] .. '_' .. className
+                    end
+
+                    if docClassName
                     and statementStart
-                    and not existingClassDocs[className]
+                    and not existingClassDocs[docClassName]
                     and not hasImmediatePrecedingClassDoc(text, statementStart) then
                         local doc
                         if bases and #bases > 0 then
-                            doc = '---@class ' .. className .. ': ' .. table.concat(bases, ', ') .. '\n'
+                            doc = '---@class ' .. docClassName .. ': ' .. table.concat(bases, ', ') .. '\n'
                         else
-                            doc = '---@class ' .. className .. '\n'
+                            doc = '---@class ' .. docClassName .. '\n'
                         end
                         diffs[#diffs + 1] = {
                             start  = statementStart,
                             finish = statementStart - 1,
                             text   = doc,
                         }
-                        existingClassDocs[className] = true
+                        existingClassDocs[docClassName] = true
+                    end
+
+                    if braceDepth == 0 and className then
+                        topLevelStack[#topLevelStack + 1] = className
                     end
                 end
             end
@@ -598,6 +696,9 @@ function M.stripWrappers(text, safeNames)
 
         elseif c == '}' then
             braceDepth = math.max(0, braceDepth - 1)
+            if braceDepth == 0 and #topLevelStack > 0 then
+                topLevelStack[#topLevelStack] = nil
+            end
             prevChar = nil
             lastWord = nil
             i = i + 1
