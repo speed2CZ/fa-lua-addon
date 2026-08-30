@@ -14,7 +14,9 @@
 -- which would otherwise make its `local NullShell = ...` declaration look unused - a harmless
 -- `local _ = NullShell` keep-alive line is inserted alongside to prevent that (see the
 -- comment at its call site for why `_` specifically, and why it reads `M.Name` instead of the
--- bare name when the base is one of the file's own exports).
+-- bare name when the base is one of the file's own exports). A base that's itself a local
+-- import-alias with a different name than what it holds (`local Foo = Module.Bar`, then
+-- `Class(Foo)`) gets resolved to `Bar` for the doc specifically - see buildAliasMap.
 --
 -- Known limitations: only the `Name = ClassFn(...) { ... }` assignment shape is handled
 -- (bare identifier target only, no dotted targets like `t.Name = ...`); an anonymous
@@ -26,6 +28,17 @@ local CLASS_FUNCTIONS = {
     Class = true, ClassSimple = true, ClassUI = true, ClassShield = true,
     ClassProjectile = true, ClassDummyProjectile = true, ClassUnit = true,
     ClassDummyUnit = true, ClassWeapon = true, ClassTrashBag = true, State = true,
+}
+
+local BLOCK_OPEN  = { ['function'] = true, ['if'] = true, ['do'] = true, ['repeat'] = true }
+local BLOCK_CLOSE = { ['end'] = true, ['until'] = true }
+local LOOP_HEADER = { ['for'] = true, ['while'] = true }
+local KEYWORDS = {
+    ['and'] = true, ['break'] = true, ['do'] = true, ['else'] = true, ['elseif'] = true,
+    ['end'] = true, ['false'] = true, ['for'] = true, ['function'] = true, ['if'] = true,
+    ['in'] = true, ['local'] = true, ['nil'] = true, ['not'] = true, ['or'] = true,
+    ['repeat'] = true, ['return'] = true, ['then'] = true, ['true'] = true, ['until'] = true,
+    ['while'] = true,
 }
 
 ---@param text string
@@ -242,6 +255,100 @@ local function firstSegment(s)
     return s
 end
 
+--- Scans for TOP-LEVEL `local Alias = RHS` declarations where RHS is either `import(...).Name`
+--- or a bare dotted-identifier chain not immediately followed by `(` (a real reference, not a
+--- function call), and resolves to a canonical name that differs from Alias's own - i.e. cases
+--- where FA renamed an import at the point of use. Depth-tracked (block keywords + braces, same
+--- shape as export-env.lua's own scan) so nested function-body locals - which commonly look
+--- like `local brain = self` or `local bp = unit.Enhancements` and have nothing to do with
+--- file-level import aliasing - are never mistaken for one; Lua keywords (`local dialog =
+--- false`) are excluded from being treated as a type name either as the alias or the resolved
+--- name. See sanitizeBase below for why this matters: confirmed real on
+--- units/XSL0001/XSL0001_script.lua, where `local SDFChronotronOverChargeCannonWeapon =
+--- SWeapons.SDFChronotronCannonOverChargeWeapon` is later used as a Class() base by its own
+--- (differently-spelled) name - the real, registered type is `SDFChronotronCannonOverChargeWeapon`
+--- (confirmed: lua/seraphimweapons.lua's own export uses that exact spelling), so injecting the
+--- local's own name into the doc produces "Undefined class".
+---@param text string
+---@return table<string, string>
+local function buildAliasMap(text)
+    local n = #text
+    local i = 1
+    local depth = 0
+    local loopHeaderDepth = 0
+    local aliasMap = {}
+    while i <= n do
+        local c = text:sub(i, i)
+        if c == '-' and text:sub(i, i + 1) == '--' then
+            local afterDashes = i + 2
+            local eqs = text:match('^%[(=*)%[', afterDashes)
+            if eqs then
+                local _, closeEnd = text:find(']' .. eqs .. ']', afterDashes + 2 + #eqs, true)
+                i = closeEnd and (closeEnd + 1) or (n + 1)
+            else
+                local nl = text:find('\n', i, true)
+                i = nl and (nl + 1) or (n + 1)
+            end
+        elseif c == '"' or c == "'" then
+            i = skipString(text, i, n, c)
+        elseif c == '[' then
+            i = skipLongBracket(text, i, n) or (i + 1)
+        elseif c:match('[%a_]') then
+            local _, e, word = text:find('^([%a_][%w_]*)', i)
+            i = e + 1
+
+            if word == 'function' then
+                depth = depth + 1
+            elseif BLOCK_OPEN[word] then
+                depth = depth + 1
+                if word == 'do' and loopHeaderDepth > 0 then
+                    loopHeaderDepth = loopHeaderDepth - 1
+                end
+            elseif BLOCK_CLOSE[word] then
+                depth = math.max(0, depth - 1)
+            elseif LOOP_HEADER[word] then
+                loopHeaderDepth = loopHeaderDepth + 1
+            elseif word == 'local' and depth == 0 and loopHeaderDepth == 0 then
+                local _, _, aliasName = text:find('^%s*([%a_][%w_]*)%s*=%s*', i)
+                if aliasName then
+                    local _, afterEqEnd = text:find('^%s*[%a_][%w_]*%s*=%s*', i)
+                    local afterEq = afterEqEnd + 1
+                    local canonical = nil
+                    local importName = text:match('^import%s*%b()%.([%a_][%w_]*)', afterEq)
+                    if importName then
+                        canonical = importName
+                    else
+                        local rhs = text:match('^[%a_][%w_%.]*', afterEq)
+                        if rhs and isSimpleTypeName(rhs) and not KEYWORDS[firstSegment(rhs)] then
+                            local rhsEnd = afterEq + #rhs
+                            local _, afterSpaceEnd = text:find('^%s*', rhsEnd)
+                            local afterSpace = afterSpaceEnd + 1
+                            if text:sub(afterSpace, afterSpace) ~= '(' then
+                                canonical = rhs:match('([%a_][%w_]*)$')
+                            end
+                        end
+                    end
+                    if canonical and KEYWORDS[canonical] then
+                        canonical = nil
+                    end
+                    if canonical and canonical ~= aliasName then
+                        aliasMap[aliasName] = canonical
+                    end
+                end
+            end
+        elseif c == '{' then
+            depth = depth + 1
+            i = i + 1
+        elseif c == '}' then
+            depth = math.max(0, depth - 1)
+            i = i + 1
+        else
+            i = i + 1
+        end
+    end
+    return aliasMap
+end
+
 --- Classifies a raw `Class(...)` base-argument's source text into something usable in a
 --- `---@class X: Base` doc. Only a bare type-name (dotted-identifier chain, e.g.
 --- `moho.unit_methods`) is a valid LuaLS type reference; anything else - a call, indexing on a
@@ -252,9 +359,17 @@ end
 --- that - correct whenever the target file kept its default, unrenamed class name, which fails
 --- safe even when wrong (a missing inherited-member completion, not a new diagnostic). Anything
 --- else unrecognised is dropped rather than guessed at.
+---
+--- `aliasMap` (from buildAliasMap) is checked first: if `baseText` is itself a local alias for
+--- something with a different canonical name, that canonical name is used instead - see
+--- buildAliasMap's own comment for the real example this fixes.
 ---@param baseText string
+---@param aliasMap table<string, string>
 ---@return string?
-local function sanitizeBase(baseText)
+local function sanitizeBase(baseText, aliasMap)
+    if aliasMap[baseText] then
+        return aliasMap[baseText]
+    end
     if isSimpleTypeName(baseText) then
         return baseText
     end
@@ -288,6 +403,7 @@ function M.stripWrappers(text, safeNames)
     for name in text:gmatch('%-%-%-@class%s+([%a_][%w_%.]*)') do
         existingClassDocs[name] = true
     end
+    local aliasMap = buildAliasMap(text)
 
     while i <= n do
         local c = text:sub(i, i)
@@ -351,7 +467,7 @@ function M.stripWrappers(text, safeNames)
                         rawBases = splitTopLevelArgs(text:sub(k + 1, j - 1))
                         bases = {}
                         for _, raw in ipairs(rawBases) do
-                            local sanitized = sanitizeBase(raw)
+                            local sanitized = sanitizeBase(raw, aliasMap)
                             if sanitized then
                                 bases[#bases + 1] = sanitized
                             end
