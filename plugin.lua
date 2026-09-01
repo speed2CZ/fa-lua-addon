@@ -10,7 +10,16 @@
 -- same position, or one scanner's diff accidentally overlapping another's - turned out to need
 -- real care of its own; see `mergeSameStartDiffs` and `resolveOverlappingDiffs` below.
 -- `ResolveRequire` separately teaches LuaLS to follow FA's root-relative `import()`/
--- `doscript()` paths.
+-- `doscript()` paths - and excludes mod hook files from ever being a resolved import target,
+-- since a hook shares its target's chunk/scope at runtime (MODS.LUA:150-198) rather than being
+-- an importable module in its own right. Hook-file merging itself is bidirectional: a hook
+-- file's own `OnSetText` prepends its target's raw content (so the hook's code can reference the
+-- target's globals while you're editing it), and - via `hookIndex`, a reverse `targetUri ->
+-- {hookUri, ...}` lookup, filled in incrementally as each hook file's own OnSetText registers
+-- itself (see hookIndex's own comment for why not an eager scan) - a target file's own
+-- `OnSetText` appends every hook that targets it, computing its exports across the combined set,
+-- so `import()`ing the target's path from anywhere else in the mod sees the union of both, not
+-- just whichever file the import happened to resolve to.
 
 local files        = require 'files'
 local furi         = require 'file-uri'
@@ -46,6 +55,27 @@ local function findUrisBySuffix(uri, relPath)
     end
     return results
 end
+
+--- Reverse of hookFiles.findTarget: targetUri -> {hookUri, ...}, which hook file(s) apply to a
+--- given target. Filled in incrementally as OnSetText processes each file over the course of the
+--- session - NOT via an eager, one-time, full-workspace scan (tried first, found broken): a
+--- `Lua.workspace.library` setup can span multiple repos with a target in one and its hook in
+--- another (confirmed real: a "missions" workspace with `Lua.workspace.library = {"../fa",
+--- "../fa-coop"}`, target in fa, hook in fa-coop's `mods/coop/hook/...`), and there's no
+--- guarantee the hook's owning library has finished loading into files.eachFile's visible set by
+--- the time the very first OnSetText call fires and would have built the index - fa's own
+--- ~2800 files alone make it near-certain the scan fires early, with fa-coop's much smaller file
+--- count not loaded yet, and a *cached-forever* index built at that moment stays wrong for the
+--- rest of the session no matter how much later fa-coop's files actually appear. Registering as
+--- each file's own OnSetText runs sidesteps this entirely: every file in the workspace -
+--- including every hook file - naturally gets its own OnSetText call at some point during normal
+--- preload (LuaLS analyzes the whole project, not just reachable-by-import files), which is
+--- exactly when it registers itself below, with no proactive scan needed at all. A target file
+--- whose own OnSetText happens to run before its hook has registered will only briefly miss it -
+--- self-corrects the next time that target file is itself opened/edited, by which point preload
+--- has settled - same "reload/retouch to pick up a workspace-wide fact" pattern the rest of this
+--- addon already relies on.
+local hookIndex = {}
 
 --- mergeDiff (script/string-merger.lua) sorts diffs by `start`, and table.sort isn't stable
 --- for ties, so two diffs that both target the same position race: which one "wins" is
@@ -127,14 +157,54 @@ end
 ---@param  text string
 ---@return nil|fa.diff[]
 function OnSetText(uri, text)
+    -- Any hook file(s) that target ME (the reverse of the hookTarget lookup below) - a mod's
+    -- hook file shares the target's chunk/scope at runtime (MODS.LUA:150-198), so `import()`ing
+    -- this file's own path should see the union of my own top-level declarations and every
+    -- applicable hook's. See "Hook files don't merge into import() targets" for the full
+    -- reasoning; without this, only a hook file's *own* OnSetText ever knew about its target
+    -- (one direction only), never the other way around.
+    local hooksApplyingToMe = hookIndex[uri]
+    local hookTexts = {}
+    if hooksApplyingToMe then
+        for _, hookUri in ipairs(hooksApplyingToMe) do
+            local hookText = files.getOriginText(hookUri)
+            if hookText then
+                -- Same BOM concern as the target-side handling below.
+                hookTexts[#hookTexts + 1] = hookText:gsub('^\239\187\191', '')
+            end
+        end
+    end
+
     -- Computed up front, before classSupport runs, because it needs to know which bare names
     -- are this file's own exports - see the comment on the base-class keep-alive inside
-    -- class-support.lua's stripWrappers for why.
-    local exports, hasTopReturn, topLevelLocalCount, unsafeNames = exportEnv.scan(text)
+    -- class-support.lua's stripWrappers for why. Combined across this file AND every hook that
+    -- targets it (if any), not just `text` alone - a name a hook adds or overrides is exactly as
+    -- much a real top-level declaration of the combined runtime chunk as one this file defines
+    -- itself.
+    local allExports, seenExport, unsafeNamesUnion = {}, {}, {}
+    local hasTopReturn, topLevelLocalCount = false, 0
+    local scanParts = { text }
+    for _, hookText in ipairs(hookTexts) do
+        scanParts[#scanParts + 1] = hookText
+    end
+    for _, part in ipairs(scanParts) do
+        local exports, partHasTopReturn, partTopLevelLocalCount, unsafeNames = exportEnv.scan(part)
+        hasTopReturn = hasTopReturn or partHasTopReturn
+        topLevelLocalCount = topLevelLocalCount + partTopLevelLocalCount
+        for _, name in ipairs(exports) do
+            if not seenExport[name] then
+                seenExport[name] = true
+                allExports[#allExports + 1] = name
+            end
+            if unsafeNames[name] then
+                unsafeNamesUnion[name] = true
+            end
+        end
+    end
     local safeNames = {}
     local unsafeList = {}
-    for _, name in ipairs(exports) do
-        if unsafeNames[name] then
+    for _, name in ipairs(allExports) do
+        if unsafeNamesUnion[name] then
             unsafeList[#unsafeList + 1] = name
         else
             safeNames[name] = true
@@ -176,6 +246,24 @@ function OnSetText(uri, text)
                 break
             end
         end
+        -- Register myself into the reverse hookIndex right here, reusing the targetUri just
+        -- resolved above - this is the ONLY place a hook file's relationship to its target gets
+        -- recorded (see hookIndex's own comment for why this incremental approach, not an eager
+        -- scan). A later OnSetText call for `targetUri` (its own, or triggered by re-opening it)
+        -- will then see me in `hooksApplyingToMe` and merge my content in.
+        if targetUri then
+            hookIndex[targetUri] = hookIndex[targetUri] or {}
+            local alreadyRegistered = false
+            for _, existingHookUri in ipairs(hookIndex[targetUri]) do
+                if existingHookUri == uri then
+                    alreadyRegistered = true
+                    break
+                end
+            end
+            if not alreadyRegistered then
+                hookIndex[targetUri][#hookIndex[targetUri] + 1] = uri
+            end
+        end
         local targetText = targetUri and files.getOriginText(targetUri)
         if targetText then
             -- script/encoder/init.lua's decode() is a no-op for utf8, so a target file with a
@@ -207,7 +295,40 @@ function OnSetText(uri, text)
         end
     end
 
-    if #exports > 0 and not hasTopReturn then
+    -- The reverse direction: hook(s) that target ME (hooksApplyingToMe/hookTexts, computed at
+    -- the top of this function) get their own transformed content appended to the END of mine -
+    -- matching the real engine's own concatenation order (MODS.LUA:150-198) and the exports
+    -- computed above. Unlike the forward (hookTarget) case above, this DOES run
+    -- exportEnv.rewriteReferences on the hook's own text (using the same combined `safeNames`
+    -- this file uses) - so a hook's own override or addition becomes part of the SAME shared `M`
+    -- below, not a separate one, which is the entire point of this fix: importing this file's
+    -- own path should see the union.
+    for _, hookText in ipairs(hookTexts) do
+        local hookDiffs = {}
+        for _, d in ipairs(hashComments.stripHashComments(hookText)) do
+            hookDiffs[#hookDiffs + 1] = d
+        end
+        for _, d in ipairs(tableHints.stripHints(hookText)) do
+            hookDiffs[#hookDiffs + 1] = d
+        end
+        for _, d in ipairs(classSupport.stripWrappers(hookText, safeNames)) do
+            hookDiffs[#hookDiffs + 1] = d
+        end
+        for _, d in ipairs(forInPairs.wrapBareIterators(hookText)) do
+            hookDiffs[#hookDiffs + 1] = d
+        end
+        for _, d in ipairs(exportEnv.rewriteReferences(hookText, safeNames)) do
+            hookDiffs[#hookDiffs + 1] = d
+        end
+        local transformedHook = smerger.mergeDiff(hookText, resolveOverlappingDiffs(mergeSameStartDiffs(hookDiffs)))
+        diffs[#diffs + 1] = {
+            start  = #text + 1,
+            finish = #text,
+            text   = '\n---@diagnostic disable\n' .. transformedHook .. '\n---@diagnostic enable\n',
+        }
+    end
+
+    if #allExports > 0 and not hasTopReturn then
         -- Turn the file into a classic module: `local M = {}`, every export becomes
         -- `M.Name = ...`, `return M`. Unlike forward-declared locals, `M.Name` field
         -- resolution isn't restricted to "last assignment before this textual position" - it
@@ -227,8 +348,9 @@ function OnSetText(uri, text)
         -- negligible: 57 names total, across 24 files, in the whole fa repo's 102,668
         -- top-level exports.
         --
-        -- `safeNames`/`unsafeList` were already computed at the top of this function (before
-        -- classSupport ran, which needs `safeNames` too).
+        -- `safeNames`/`unsafeList` were already computed at the top of this function, combined
+        -- across this file and any hook that targets it (before classSupport ran, which needs
+        -- `safeNames` too).
 
         -- Appended to `diffs` BEFORE the reference-rewrite diffs below, not after: if the file's
         -- very first byte is itself the start of a safe export's name (no leading comment/blank
@@ -283,6 +405,23 @@ function ResolveRequire(uri, name, suri)
     end
 
     local results = findUrisBySuffix(uri, name)
+    -- A hook file (`<mod>/hook/lua/sim/SomeFile.lua`) mirrors the target's own path suffix
+    -- (`/lua/sim/SomeFile.lua`), so it always matches too - but nobody writes `import()`s
+    -- pointing at a hookdir path; every import means "give me the target's module", hooks
+    -- included (see OnSetText's hooksApplyingToMe/hookIndex handling above for the merge
+    -- itself). Without this filter, which candidate "wins" - target or hook - depends on
+    -- files.eachFile's iteration order, not anything meaningful (confirmed: LuaLS only ever
+    -- uses the first entry of a multi-candidate ResolveRequire result, never a union).
+    local filtered = {}
+    for _, candidateUri in ipairs(results) do
+        local candidateText = files.getOriginText(candidateUri)
+        if not (candidateText and hookFiles.findTarget(candidateUri, candidateText)) then
+            filtered[#filtered + 1] = candidateUri
+        end
+    end
+    if #filtered > 0 then
+        return filtered
+    end
     if #results > 0 then
         return results
     end
